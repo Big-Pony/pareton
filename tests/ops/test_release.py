@@ -1577,6 +1577,22 @@ def test_interrupted_verifying_startup_frees_recovery_request_slot(base):
     assert release.cmd_request(["rollback", "--operator", "o"]) == 0
 
 
+def test_partial_startup_with_old_failure_step_still_fails(base):
+    write_state(
+        base,
+        phase="verifying",
+        target_commit="B",
+        verified_commit="A",
+        startup_complete=False,
+        failure_step="log-ingestion",
+    )
+
+    assert release.tick([]) == 2
+    state = read_state(base)
+    assert state["startup_complete"] is False
+    assert state["failure_step"] == "verifying-partial-startup"
+
+
 def test_verify_rechecks_current_health_before_logs(base, monkeypatch):
     write_state(
         base,
@@ -1606,6 +1622,11 @@ def test_verify_rechecks_current_health_before_logs(base, monkeypatch):
     assert state["verified_commit"] == "A"
     assert state["startup_complete"] is False
     assert state["failure_step"] == "health-check-failed"
+    assert release.tick([]) == 0
+    state = read_state(base)
+    assert state["failure_step"] == "health-check-failed"
+    run_state = (base / "var/lib/pareton-deploy/last-run.env").read_text()
+    assert "last_step=log-unaccepted" in run_state
 
 
 def test_vector_fast_path_rechecks_current_health_before_logs(base, monkeypatch):
