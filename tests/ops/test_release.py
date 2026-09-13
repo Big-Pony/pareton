@@ -894,6 +894,7 @@ def test_vector_fast_path_happy_path(base, monkeypatch):
     release.run_cmd.sync_stdout = json.dumps(
         {"findings": [{"category": "different", "target": "/etc/vector/vector.toml"}]}
     )
+    monkeypatch.setattr(release, "_current_environment_healthy", lambda: True)
     monkeypatch.setattr(release, "gpu_probe_flow", lambda op_id, probe: None)
     monkeypatch.setattr(
         release, "run_log_check", lambda probe, **kw: (0, {"missing": []})
@@ -1460,6 +1461,7 @@ def test_vector_fast_path_log_failure_is_unaccepted_steady_state(base, monkeypat
     release.run_cmd.sync_stdout = json.dumps(
         {"findings": [{"category": "different", "target": "/etc/vector/vector.toml"}]}
     )
+    monkeypatch.setattr(release, "_current_environment_healthy", lambda: True)
     monkeypatch.setattr(release, "gpu_probe_flow", lambda op_id, probe: None)
     monkeypatch.setattr(
         release,
@@ -1477,6 +1479,424 @@ def test_vector_fast_path_log_failure_is_unaccepted_steady_state(base, monkeypat
     assert release.tick([]) == 0
     run_state = (base / "var/lib/pareton-deploy/last-run.env").read_text()
     assert "last_step=log-unaccepted" in run_state
+
+
+def test_vector_repair_install_failure_frees_request_without_certifying_target(
+    base, monkeypatch
+):
+    write_state(
+        base,
+        phase="verifying",
+        scope="full",
+        target_commit="B",
+        verified_commit="A",
+        startup_complete=True,
+        failure_step="axiom-query",
+        recovery_copy="/saved/A",
+        recovery_commit="A",
+    )
+    release.write_json_atomic(
+        base / "var/lib/pareton-deploy/release-request.json",
+        {
+            "type": "vector-repair",
+            "target": "C",
+            "status": "pending",
+            "operator": "o",
+            "registered_at": release.now_iso(),
+        },
+    )
+    release.run_cmd.git_refs = {"HEAD": "B"}
+    release.run_cmd.git_diff = "ops/vector/vector.toml\n"
+    release.run_cmd.sync_apply_exit = 4
+
+    assert release.tick([]) == 2
+    request = json.loads(
+        (base / "var/lib/pareton-deploy/release-request.json").read_text()
+    )
+    state = read_state(base)
+    assert request["status"] == "failed"
+    assert request["result"]["step"] == "vector-repair-install-failed"
+    assert (state["phase"], state["target_commit"], state["recovery_copy"]) == (
+        "verifying",
+        "C",
+        "/saved/A",
+    )
+
+    release.write_json_atomic(
+        base / "var/lib/pareton-deploy/release-request.json",
+        {
+            "type": "verify",
+            "status": "pending",
+            "operator": "o",
+            "registered_at": release.now_iso(),
+        },
+    )
+    monkeypatch.setattr(
+        release,
+        "verify_flow",
+        lambda *_args, **_kwargs: pytest.fail(
+            "verify must not certify an uninstalled target"
+        ),
+    )
+    assert release.tick([]) == 1
+    request = json.loads(
+        (base / "var/lib/pareton-deploy/release-request.json").read_text()
+    )
+    assert request["status"] == "failed"
+    assert request["result"]["step"] == "verify-install-failed"
+    assert read_state(base)["verified_commit"] == "A"
+
+
+def test_interrupted_verifying_startup_frees_recovery_request_slot(base):
+    write_state(
+        base,
+        phase="verifying",
+        target_commit="B",
+        verified_commit="A",
+        startup_complete=False,
+        recovery_copy="/saved/A",
+        recovery_commit="A",
+    )
+    release.write_json_atomic(
+        base / "var/lib/pareton-deploy/release-request.json",
+        {
+            "type": "resume",
+            "status": "running",
+            "operator": "o",
+            "registered_at": release.now_iso(),
+        },
+    )
+
+    assert release.tick([]) == 2
+    request = json.loads(
+        (base / "var/lib/pareton-deploy/release-request.json").read_text()
+    )
+    assert request["status"] == "failed"
+    assert request["result"]["step"] == "verifying-partial-startup"
+    assert read_state(base)["target_commit"] == "B"
+    assert release.cmd_request(["rollback", "--operator", "o"]) == 0
+
+
+def test_verify_rechecks_current_health_before_logs(base, monkeypatch):
+    write_state(
+        base,
+        phase="verifying",
+        target_commit="B",
+        verified_commit="A",
+        startup_complete=True,
+    )
+    checked = []
+    monkeypatch.setattr(
+        release,
+        "_wait_unit_healthy",
+        lambda unit, budget: checked.append(unit) or False,
+    )
+    monkeypatch.setattr(release, "gpu_probe_flow", lambda *_args: None)
+    monkeypatch.setattr(
+        release,
+        "run_log_check",
+        lambda *_args, **_kwargs: pytest.fail(
+            "logs must not certify an unhealthy target"
+        ),
+    )
+
+    assert release.verify_flow(read_state(base), fresh_start=False) == 2
+    assert checked == ["pareton-api"]
+    state = read_state(base)
+    assert state["verified_commit"] == "A"
+    assert state["startup_complete"] is False
+    assert state["failure_step"] == "health-check-failed"
+
+
+def test_vector_fast_path_rechecks_current_health_before_logs(base, monkeypatch):
+    write_state(base)
+    release.run_cmd.git_refs = {"origin/main": "B", "HEAD": "A"}
+    release.run_cmd.git_diff = "ops/vector/vector.toml\n"
+    release.run_cmd.sync_exit = 1
+    release.run_cmd.sync_stdout = json.dumps(
+        {"findings": [{"category": "different", "target": "/etc/vector/vector.toml"}]}
+    )
+    checked = []
+    monkeypatch.setattr(
+        release,
+        "_wait_unit_healthy",
+        lambda unit, budget: checked.append(unit) or False,
+    )
+    monkeypatch.setattr(
+        release,
+        "run_log_check",
+        lambda *_a, **_k: pytest.fail(
+            "unhealthy vector target must not be logged as accepted"
+        ),
+    )
+
+    assert release.tick([]) == 2
+    assert checked == ["pareton-api"]
+    state = read_state(base)
+    assert (state["phase"], state["scope"], state["target_commit"]) == (
+        "verifying",
+        "vector-only",
+        "B",
+    )
+    assert state["verified_commit"] == "c1"
+    assert state["failure_step"] == "health-check-failed"
+
+
+def test_vector_repair_rechecks_current_health_before_logs(base, monkeypatch):
+    write_state(
+        base,
+        phase="verifying",
+        target_commit="B",
+        verified_commit="A",
+        startup_complete=True,
+        failure_step="axiom-query",
+        recovery_copy="/saved/A",
+        recovery_commit="A",
+    )
+    release.write_json_atomic(
+        base / "var/lib/pareton-deploy/release-request.json",
+        {
+            "type": "vector-repair",
+            "target": "C",
+            "status": "pending",
+            "operator": "o",
+            "registered_at": release.now_iso(),
+        },
+    )
+    release.run_cmd.git_refs = {"HEAD": "B"}
+    release.run_cmd.git_diff = "ops/vector/vector.toml\n"
+    checked = []
+    monkeypatch.setattr(
+        release,
+        "_wait_unit_healthy",
+        lambda unit, budget: checked.append(unit) or False,
+    )
+    monkeypatch.setattr(
+        release,
+        "run_log_check",
+        lambda *_a, **_k: pytest.fail(
+            "unhealthy vector repair must not be logged as accepted"
+        ),
+    )
+
+    assert release.tick([]) == 2
+    assert checked == ["pareton-api"]
+    state = read_state(base)
+    assert (state["phase"], state["target_commit"], state["verified_commit"]) == (
+        "verifying",
+        "C",
+        "A",
+    )
+    assert state["failure_step"] == "health-check-failed"
+    request = json.loads(
+        (base / "var/lib/pareton-deploy/release-request.json").read_text()
+    )
+    assert request["status"] == "failed"
+
+
+def test_vector_preparation_failure_keeps_fixed_scope_and_target(base, monkeypatch):
+    write_state(base)
+    release.run_cmd.git_refs = {"origin/main": "B", "HEAD": "A"}
+    release.run_cmd.git_diff = "ops/vector/vector.toml\n"
+    release.run_cmd.sync_exit = 1
+    release.run_cmd.sync_stdout = json.dumps(
+        {"findings": [{"category": "different", "target": "/etc/vector/vector.toml"}]}
+    )
+    monkeypatch.setattr(release, "_current_environment_healthy", lambda: True)
+    monkeypatch.setattr(
+        release,
+        "gpu_probe_flow",
+        lambda *_args: (_ for _ in ()).throw(release.Fail(1, "gpu-reap-wait-timeout")),
+    )
+
+    assert release.tick([]) == 1
+    state = read_state(base)
+    assert (state["phase"], state["scope"], state["target_commit"]) == (
+        "verifying",
+        "vector-only",
+        "B",
+    )
+    assert state["verified_commit"] == "c1"
+    assert state["failure_step"] == "gpu-reap-wait-timeout"
+
+
+def test_vector_install_failure_waits_for_explicit_recovery(base, monkeypatch):
+    write_state(base)
+    release.run_cmd.git_refs = {"origin/main": "B", "HEAD": "A"}
+    release.run_cmd.git_diff = "ops/vector/vector.toml\n"
+    release.run_cmd.sync_exit = 1
+    release.run_cmd.sync_stdout = json.dumps(
+        {"findings": [{"category": "different", "target": "/etc/vector/vector.toml"}]}
+    )
+    release.run_cmd.sync_apply_exit = 4
+
+    assert release.tick([]) == 4
+    state = read_state(base)
+    assert (state["phase"], state["scope"], state["target_commit"]) == (
+        "applying",
+        "vector-only",
+        "B",
+    )
+    assert state["verified_commit"] == "c1"
+    assert state["failure_step"] == "vector-install-failed"
+    assert release.tick([]) == 2
+    assert read_state(base)["target_commit"] == "B"
+    assert release.cmd_request(["resume", "--operator", "o"]) == 0
+
+
+def test_vector_resume_success_stays_vector_only_and_finishes_request(
+    base, monkeypatch
+):
+    write_state(
+        base,
+        phase="applying",
+        scope="vector-only",
+        target_commit="B",
+        verified_commit="A",
+        startup_complete=True,
+        failure_step="vector-install-failed",
+    )
+    release.run_cmd.git_refs = {"HEAD": "A"}
+    release.run_cmd.sync_apply_exit = 0
+    monkeypatch.setattr(release, "_current_environment_healthy", lambda: True)
+    monkeypatch.setattr(release, "gpu_probe_flow", lambda *_args: None)
+    monkeypatch.setattr(
+        release, "run_log_check", lambda *_args, **_kwargs: (0, {"missing": []})
+    )
+    full_path_calls = []
+    monkeypatch.setattr(
+        release,
+        "_start_recovery_operation",
+        lambda *_args, **_kwargs: full_path_calls.append("drain") or 99,
+    )
+    for name in ("snapshot_units", "stop_unit", "save_recovery_copy"):
+        monkeypatch.setattr(
+            release,
+            name,
+            lambda *args, _name=name, **kwargs: pytest.fail(
+                f"vector resume called {_name}"
+            ),
+        )
+
+    assert release.cmd_request(["resume", "--operator", "o"]) == 0
+    assert release.tick([]) == 0
+    state = read_state(base)
+    request = json.loads(
+        (base / "var/lib/pareton-deploy/release-request.json").read_text()
+    )
+    assert full_path_calls == []
+    assert (state["phase"], state["scope"], state["target_commit"]) == (
+        "idle",
+        "full",
+        "B",
+    )
+    assert state["verified_commit"] == "B"
+    assert request["status"] == "done"
+
+
+def test_vector_repair_resume_failure_preserves_target_and_frees_request(
+    base, monkeypatch
+):
+    write_state(
+        base,
+        phase="verifying",
+        scope="full",
+        target_commit="C",
+        verified_commit="A",
+        startup_complete=True,
+        failure_step="vector-repair-install-failed",
+        recovery_copy="/saved/A",
+        recovery_commit="A",
+    )
+    release.run_cmd.git_refs = {"HEAD": "C"}
+    release.run_cmd.sync_apply_exit = 4
+    full_path_calls = []
+    monkeypatch.setattr(
+        release,
+        "_start_recovery_operation",
+        lambda *_args, **_kwargs: full_path_calls.append("drain") or 99,
+    )
+    for name in ("snapshot_units", "stop_unit", "save_recovery_copy"):
+        monkeypatch.setattr(
+            release,
+            name,
+            lambda *args, _name=name, **kwargs: pytest.fail(
+                f"vector resume called {_name}"
+            ),
+        )
+
+    assert release.cmd_request(["resume", "--operator", "o"]) == 0
+    assert release.tick([]) == 4
+    state = read_state(base)
+    request = json.loads(
+        (base / "var/lib/pareton-deploy/release-request.json").read_text()
+    )
+    assert full_path_calls == []
+    assert (state["phase"], state["scope"], state["target_commit"]) == (
+        "applying",
+        "vector-only",
+        "C",
+    )
+    assert state["recovery_copy"] == "/saved/A"
+    assert request["status"] == "failed"
+    assert request["result"]["step"] == "vector-install-failed"
+    assert release.cmd_request(["resume", "--operator", "o"]) == 0
+
+
+def test_vector_commit_without_existing_drift_uses_fast_path(base, monkeypatch):
+    write_state(base)
+    release.run_cmd.git_refs = {"origin/main": "B", "HEAD": "A"}
+    release.run_cmd.git_diff = "ops/vector/vector.toml\n"
+    release.run_cmd.sync_exit = 0
+    monkeypatch.setattr(release, "_current_environment_healthy", lambda: True)
+    monkeypatch.setattr(release, "gpu_probe_flow", lambda *_args: None)
+    monkeypatch.setattr(
+        release, "run_log_check", lambda *_args, **_kwargs: (0, {"missing": []})
+    )
+
+    assert release.tick([]) == 0
+    state = read_state(base)
+    assert state["phase"] == "idle"
+    assert state["verified_commit"] == "B"
+
+
+def test_busy_drain_reports_expected_service_failure(base):
+    import fcntl
+
+    write_state(
+        base,
+        phase="draining",
+        original_units={"pareton-api": {"active": True}},
+    )
+    fd = os.open(str(base / "run/pareton-activity.lock"), os.O_CREAT | os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_SH)
+    try:
+        assert release.tick([]) == 2
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    run_state = (base / "var/lib/pareton-deploy/last-run.env").read_text()
+    assert "last_step=service-health-error" in run_state
+    assert any(
+        argv[:3] == ["systemctl", "is-active", "pareton-api.service"]
+        for argv in release.run_cmd.calls
+    )
+
+
+def test_busy_drain_db_failure_is_immediate(base):
+    import fcntl
+
+    write_state(base, phase="draining")
+    release.run_cmd.db = {"error": "OperationalError"}
+    fd = os.open(str(base / "run/pareton-activity.lock"), os.O_CREAT | os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_SH)
+    try:
+        assert release.tick([]) == 2
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    run_state = (base / "var/lib/pareton-deploy/last-run.env").read_text()
+    assert "last_step=active-work-db-unavailable" in run_state
 
 
 def test_degraded_mode_fails_closed_and_compares_whole_files(base, monkeypatch):
@@ -1835,6 +2255,7 @@ def test_vector_fast_path_hands_the_lock_to_sync(base, monkeypatch):
     release.run_cmd.sync_stdout = json.dumps(
         {"findings": [{"category": "different", "target": "/etc/vector/vector.toml"}]}
     )
+    monkeypatch.setattr(release, "_current_environment_healthy", lambda: True)
     monkeypatch.setattr(release, "gpu_probe_flow", lambda op_id, probe: None)
     monkeypatch.setattr(
         release, "run_log_check", lambda probe, **kw: (0, {"missing": []})

@@ -1163,9 +1163,9 @@ def tick_idle(state: dict) -> int:
     # restart debt.
     changed_files = _changed_files(state["verified_commit"], target)
     vector_only = (
-        all(f == "ops/vector/vector.toml" for f in changed_files)
-        and drift_exit == 1
-        and _drift_only_vector()
+        bool(changed_files)
+        and all(f == "ops/vector/vector.toml" for f in changed_files)
+        and (drift_exit == 0 or _drift_only_vector())
     )
     if vector_only:
         return vector_fast_path(state, target)
@@ -1237,25 +1237,43 @@ def _drift_only_vector() -> bool:
     return all(f.get("target") == "/etc/vector/vector.toml" for f in findings)
 
 
-def vector_fast_path(state: dict, target: str) -> int:
-    op_id = str(uuid.uuid4())
-    mutate_state(
-        lambda s: s.update(
-            {
-                "op_id": op_id,
-                "phase": "applying",
-                "scope": "vector-only",
-                "direction": "forward",
-                "from_commit": s["verified_commit"],
-                "target_commit": target,
-                "startup_complete": True,
-                "log_accepted": False,
-                "failure_step": None,
-                "phase_since": now_iso(),
-                "original_units": snapshot_units(),
-            }
+def vector_fast_path(
+    state: dict, target: str, request: dict | None = None, *, resume: bool = False
+) -> int:
+    installed = False
+    op_id = state["op_id"] if resume else str(uuid.uuid4())
+    if resume:
+        mutate_state(
+            lambda s: s.update(
+                {
+                    "phase": "applying",
+                    "scope": "vector-only",
+                    "target_commit": target,
+                    "startup_complete": True,
+                    "log_accepted": False,
+                    "failure_step": None,
+                    "phase_since": now_iso(),
+                }
+            )
         )
-    )
+    else:
+        mutate_state(
+            lambda s: s.update(
+                {
+                    "op_id": op_id,
+                    "phase": "applying",
+                    "scope": "vector-only",
+                    "direction": "forward",
+                    "from_commit": s["verified_commit"],
+                    "target_commit": target,
+                    "startup_complete": True,
+                    "log_accepted": False,
+                    "failure_step": None,
+                    "phase_since": now_iso(),
+                    "original_units": snapshot_units(),
+                }
+            )
+        )
     try:
         dirty = git("status", "--porcelain", "--untracked-files=no")
         if dirty.stdout.strip():
@@ -1281,21 +1299,45 @@ def vector_fast_path(state: dict, target: str) -> int:
                 "vector-install-failed",
                 detail=result.stdout.strip()[:400],
             )
+        installed = True
+        if not _current_environment_healthy():
+            _mark_health_check_failed()
+            return 2
         probe = write_probe(str(uuid.uuid4()), target)
         gpu_probe_flow(op_id, probe)
         emit_deploy_probe(probe)
         code, report = run_log_check(probe)
     except Fail as failure:
         reason, code = failure.reason, failure.code
+        if resume:
+            phase, scope = "verifying" if installed else "applying", "vector-only"
+        else:
+            phase = (
+                "verifying"
+                if installed
+                else "applying"
+                if reason == "vector-install-failed"
+                else "idle"
+            )
+            scope = "vector-only" if phase != "idle" else "full"
         mutate_state(
             lambda s: s.update(
-                {"phase": "idle", "scope": "full", "failure_step": reason}
+                {
+                    "phase": phase,
+                    "scope": scope,
+                    "startup_complete": installed,
+                    "log_accepted": False,
+                    "target_commit": target,
+                    "failure_step": reason,
+                }
             )
         )
         _restore_maint_timers(load_state())
         record_step(reason)
         print(f"release: {reason}", file=sys.stderr)
         clear_coordination_files()
+        if request is not None:
+            _finish_request("failed", {"step": reason})
         return code or 2
     _restore_maint_timers(load_state())
     if code != 0:
@@ -1319,6 +1361,13 @@ def vector_fast_path(state: dict, target: str) -> int:
         )
         print(f"release: log check failed: {json.dumps(report)[:400]}", file=sys.stderr)
         clear_coordination_files()
+        if request is not None:
+            _finish_request(
+                "failed",
+                {
+                    "step": "log-ingestion" if code == 1 else "axiom-query",
+                },
+            )
         return 1 if code == 1 else 2
     clear_coordination_files()
     mutate_state(
@@ -1334,6 +1383,8 @@ def vector_fast_path(state: dict, target: str) -> int:
     )
     alias_path().write_text(target + "\n")
     record_step("done")
+    if request is not None:
+        _finish_request("done", {"target": target})
     print(f"release: vector-only {state['verified_commit'][:12]} -> {target[:12]}")
     return 0
 
@@ -1343,21 +1394,52 @@ def tick_draining(state: dict) -> int:
     if activity is None:
         # Workers hold the shared lock: report live work, never force.
         records = db_running_records()
+        if records.get("error"):
+            detail = {"active-work": True, "error": records["error"]}
+            mutate_state(
+                lambda s: s.update({"failure_step": "active-work-db-unavailable"})
+            )
+            record_step(
+                "active-work-db-unavailable",
+                {"detail": json.dumps(detail, default=str)[:600]},
+            )
+            print(
+                f"release: db probe failed while activity lock is busy "
+                f"({records['error']})",
+                file=sys.stderr,
+            )
+            return 2
+
+        snapshot = state.get("original_units") or {}
+        unhealthy = [
+            f"{unit}.service"
+            for unit in RESIDENT_UNITS
+            if snapshot.get(unit, {}).get("active") is True
+            and not unit_strictly_active(f"{unit}.service")
+        ]
+        if unhealthy:
+            detail = {"active-work": True, "unhealthy_units": unhealthy}
+            mutate_state(lambda s: s.update({"failure_step": "service-health-error"}))
+            record_step(
+                "service-health-error",
+                {"detail": json.dumps(detail, default=str)[:600]},
+            )
+            print(
+                f"release: expected resident services are not active: {unhealthy}",
+                file=sys.stderr,
+            )
+            return 2
+
         detail = {
             "active-work": True,
-            "rounds": records.get("rounds", []) if not records.get("error") else None,
-            "submissions": (
-                records.get("submissions", []) if not records.get("error") else None
-            ),
+            "rounds": records.get("rounds", []),
+            "submissions": records.get("submissions", []),
         }
-        step = (
-            "active-work" if not records.get("error") else "active-work-db-unavailable"
-        )
         since = parse_iso(state.get("phase_since") or state.get("updated_at") or "")
         waited = (parse_iso(now_iso()) - since).total_seconds() if since else 0
         mutate_state(lambda s: s.update({"failure_step": None}))
         record_step(
-            step,
+            "active-work",
             {
                 "detail": json.dumps(detail, default=str)[:600],
                 "draining_since": state.get("phase_since", ""),
@@ -1626,6 +1708,13 @@ def tick_continue(op_id: str) -> int:
 def tick_verifying_resume(state: dict) -> int:
     """A tick found phase=verifying with startup complete."""
     if state.get("startup_complete") is not True:
+        failure_step = "verifying-partial-startup"
+        mutate_state(
+            lambda s: s.update(
+                {"failure_step": failure_step, "startup_complete": False}
+            )
+        )
+        _finish_request("failed", {"step": failure_step})
         record_step("verifying-partial-startup")
         print(
             "release: target partially started; use request resume or rollback",
@@ -1636,6 +1725,9 @@ def tick_verifying_resume(state: dict) -> int:
         "log-ingestion",
         "axiom-query",
         "notification-acceptance-required",
+        "health-check-failed",
+        "gpu-reap-wait-timeout",
+        "vector-repair-install-failed",
     ):
         # A finished-but-failed verification is the "running, unaccepted"
         # steady state (spec 4.2): business continues, automatic re-verify
@@ -1669,6 +1761,31 @@ def _wait_unit_healthy(unit: str, budget_s: int) -> bool:
             return True
         time.sleep(2)
     return api_healthy() if unit == "pareton-api" else unit_strictly_active(unit)
+
+
+def _current_environment_healthy() -> bool:
+    return all(
+        _wait_unit_healthy(unit, API_HEALTH_TIMEOUT_S)
+        for unit in (*RESIDENT_UNITS, *WORKER_UNITS)
+    )
+
+
+def _mark_health_check_failed() -> None:
+    failure_step = "health-check-failed"
+    mutate_state(
+        lambda s: s.update(
+            {
+                "phase": "verifying",
+                "startup_complete": False,
+                "log_accepted": False,
+                "failure_step": failure_step,
+            }
+        )
+    )
+    _restore_maint_timers(load_state())
+    _finish_request("failed", {"step": failure_step})
+    clear_coordination_files()
+    record_step(failure_step)
 
 
 def _mark_start_failed(unit: str) -> None:
@@ -1712,6 +1829,9 @@ def verify_flow(state: dict, *, fresh_start: bool) -> int:
         # reporting "partial startup" instead of resuming past it.
         mutate_state(lambda s: s.update({"startup_complete": True}))
     else:
+        if not _current_environment_healthy():
+            _mark_health_check_failed()
+            return 2
         probe = write_probe(str(uuid.uuid4()), target)
 
     gpu_probe_flow(state["op_id"], probe)
@@ -2059,6 +2179,14 @@ def _request_resume(state: dict, request: dict) -> int:
             file=sys.stderr,
         )
         return 1
+    if (
+        state.get("scope") == "vector-only"
+        or state.get("failure_step") == "vector-repair-install-failed"
+    ):
+        _mark_request_running(request)
+        return vector_fast_path(
+            state, state["target_commit"], request=request, resume=True
+        )
     return _start_recovery_operation(
         state, request, state.get("direction", "forward"), state["target_commit"]
     )
@@ -2138,6 +2266,14 @@ def _request_cancel(state: dict, request: dict) -> int:
 
 
 def _request_verify(state: dict, request: dict) -> int:
+    if state.get("failure_step") == "vector-repair-install-failed":
+        _refuse(request, "verify-install-failed")
+        print(
+            "request verify: vector repair did not install its target; use resume "
+            "or rollback",
+            file=sys.stderr,
+        )
+        return 1
     if state["phase"] not in ("verifying", "idle"):
         _refuse(request, "verify-not-applicable")
         print(f"request verify: phase is {state['phase']}", file=sys.stderr)
@@ -2257,10 +2393,27 @@ def _request_vector_repair(state: dict, request: dict) -> int:
         **_sync_coordination(),
     )
     if result.returncode != 0:
-        mutate_state(retarget)
+        failure_step = "vector-repair-install-failed"
+        mutate_state(
+            lambda s: s.update(
+                {
+                    "target_commit": repair_target,
+                    "vector_repair_from": state["target_commit"],
+                    "phase": "verifying",
+                    "scope": "vector-only",
+                    "startup_complete": True,
+                    "log_accepted": False,
+                    "failure_step": failure_step,
+                }
+            )
+        )
+        _finish_request("failed", {"step": failure_step})
         record_step("vector-repair-install-failed")
         return 2
     mutate_state(retarget)
+    if not _current_environment_healthy():
+        _mark_health_check_failed()
+        return 2
     probe = write_probe(str(uuid.uuid4()), repair_target)
     gpu_probe_flow(state["op_id"], probe)
     emit_deploy_probe(probe)

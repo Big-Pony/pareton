@@ -127,7 +127,17 @@ def _acquire_open_gate(should_abort: Callable[[], bool] | None, once: bool) -> i
         # O_CREAT: the file may not exist yet on a fresh boot where workers
         # start before any deploy tick has taken the exclusive side.
         fd = os.open(str(activity_lock_path()), os.O_RDWR | os.O_CREAT, 0o644)
-        fcntl.flock(fd, fcntl.LOCK_SH)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            if once:
+                raise ClaimAborted("gate-closed")
+            if time.monotonic() - last_event >= PARK_EVENT_INTERVAL_S:
+                _emit("deployment_wait", reason="activity-lock")
+                last_event = time.monotonic()
+            _wait_abortable(GATE_POLL_S, should_abort)
+            continue
         open_, detail = gate_open()
         if open_:
             return fd
@@ -149,10 +159,13 @@ def _acquire_open_gate(should_abort: Callable[[], bool] | None, once: bool) -> i
 
 def _wait_abortable(seconds: float, should_abort: Callable[[], bool] | None) -> None:
     deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
+    while True:
         if should_abort and should_abort():
             raise ClaimAborted("drain")
-        time.sleep(1)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(1.0, remaining))
 
 
 def _park(should_abort: Callable[[], bool] | None) -> None:

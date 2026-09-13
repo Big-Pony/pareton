@@ -37,12 +37,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ops_common import parse_env_file  # noqa: E402
+from ops_common import parse_env_file
 
-from db.connection import db_connection  # noqa: E402
+from db.connection import db_connection
 
 TERMINAL_REJECT_STATES = ("rejected", "rejected_duplicate", "disqualified")
 PROGRESS_STATES = ("bench_queued", "scored")
+_UNSET_BENCH = object()
 
 
 def _load_application_env() -> None:
@@ -129,9 +130,13 @@ def coordination():
 def load_job(cur, job_id: int) -> dict | None:
     cur.execute(
         """
-        SELECT id, submission_id, status, attempts, phase, heartbeat_at,
-               progress, last_error, created_at, updated_at
-        FROM submission_jobs WHERE id = %s
+        SELECT j.id, j.submission_id, j.status, j.attempts, j.phase, j.heartbeat_at,
+               j.progress, j.last_error, j.created_at, j.updated_at,
+               s.campaign_id, c.bench AS campaign_bench
+        FROM submission_jobs j
+        JOIN submissions s ON s.id = j.submission_id
+        JOIN campaigns c ON c.id = s.campaign_id
+        WHERE j.id = %s
         """,
         (job_id,),
     )
@@ -149,6 +154,8 @@ def load_job(cur, job_id: int) -> dict | None:
         "last_error",
         "created_at",
         "updated_at",
+        "campaign_id",
+        "campaign_bench",
     )
     return dict(zip(keys, row))
 
@@ -159,7 +166,7 @@ def load_states(cur, submission_id) -> list[str]:
         SELECT state FROM submission_events
         WHERE submission_id = %s
           AND state IN ('rejected', 'rejected_duplicate', 'disqualified',
-                        'bench_queued', 'scored')
+                        'bench_queued', 'scored', 'built')
         ORDER BY created_at
         """,
         (str(submission_id),),
@@ -205,15 +212,18 @@ def cmd_recover(args: argparse.Namespace) -> int:
         return 2
     with coordination() as phase, db_connection() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT id, submission_id, status, attempts FROM "
-            "submission_jobs WHERE id = %s FOR UPDATE",
+            "SELECT j.id, j.submission_id, j.status, j.attempts, c.bench "
+            "FROM submission_jobs j "
+            "JOIN submissions s ON s.id = j.submission_id "
+            "JOIN campaigns c ON c.id = s.campaign_id "
+            "WHERE j.id = %s FOR UPDATE OF j",
             (args.job,),
         )
         row = cur.fetchone()
         if row is None:
             print(f"recover: job {args.job} not found")
             return 1
-        job_id, submission_id, status, attempts = row
+        job_id, submission_id, status, attempts, campaign_bench = row
         if status != "running":
             print(
                 f"recover: job {job_id} status is {status!r}, "
@@ -228,7 +238,12 @@ def cmd_recover(args: argparse.Namespace) -> int:
             return 1
         states = load_states(cur, submission_id)
         klass = evidence_class(states)
-        target = _decide(args.outcome, klass, states)
+        target = _decide(
+            args.outcome,
+            klass,
+            states,
+            campaign_bench=campaign_bench,
+        )
         if target is None:
             print(
                 f"recover: outcome {args.outcome} refused for evidence "
@@ -284,14 +299,21 @@ def cmd_recover(args: argparse.Namespace) -> int:
     return 0
 
 
-def _decide(outcome: str, klass: str, states: list[str]) -> str | None:
+def _decide(
+    outcome: str,
+    klass: str,
+    states: list[str],
+    *,
+    campaign_bench: object = _UNSET_BENCH,
+) -> str | None:
     """Map (requested outcome, evidence) to a job status, or refuse.
 
     requeue: only with no durable evidence at all — a rerun may build again,
     which the operator explicitly accepts; it never emits miner-visible
     rejection events.
     settle: terminal-reject evidence -> failed; progressed past gates
-    (bench_queued/scored) -> done. Contradictory evidence refuses.
+    (bench_queued/scored) -> done. A successful built event is enough only
+    when the campaign explicitly has no bench. Contradictory evidence refuses.
     """
     if klass == "contradictory":
         return None
@@ -301,6 +323,8 @@ def _decide(outcome: str, klass: str, states: list[str]) -> str | None:
         if klass == "terminal-reject":
             return "failed"
         if klass == "progressed":
+            return "done"
+        if campaign_bench is None and "built" in states:
             return "done"
     return None
 

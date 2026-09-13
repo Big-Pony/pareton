@@ -5,7 +5,6 @@ import json
 import os
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
@@ -89,9 +88,11 @@ def test_closed_gate_waits_then_proceeds(env):
 
 def test_once_with_closed_gate_aborts(env):
     write_state(env, phase="applying")
-    with pytest.raises(coordination.ClaimAborted) as info:
-        with coordination.claim_guard(once=True):
-            pytest.fail("must not claim")
+    with (
+        pytest.raises(coordination.ClaimAborted) as info,
+        coordination.claim_guard(once=True),
+    ):
+        pytest.fail("must not claim")
     assert info.value.reason == "gate-closed"
 
 
@@ -127,10 +128,67 @@ def test_drain_cuts_the_closed_gate_wait(env):
     write_state(env, phase="draining")
     stop = threading.Event()
     stop.set()
-    with pytest.raises(coordination.ClaimAborted) as info:
-        with coordination.claim_guard(should_abort=stop.is_set):
-            pytest.fail("must not claim")
+    with (
+        pytest.raises(coordination.ClaimAborted) as info,
+        coordination.claim_guard(should_abort=stop.is_set),
+    ):
+        pytest.fail("must not claim")
     assert info.value.reason == "drain"
+
+
+def test_busy_activity_lock_is_interruptible_for_resident_worker(env):
+    write_state(env)
+    holder = os.open(str(env["lock"]), os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    stop = threading.Event()
+    result = []
+
+    def claim():
+        try:
+            with coordination.claim_guard(should_abort=stop.is_set):
+                result.append("claimed")
+        except coordination.ClaimAborted as exc:
+            result.append(exc.reason)
+
+    thread = threading.Thread(target=claim)
+    thread.start()
+    try:
+        time.sleep(0.05)
+        stop.set()
+        thread.join(0.5)
+        assert not thread.is_alive(), "drain must interrupt a busy lock wait"
+        assert result == ["drain"]
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+        thread.join(1)
+
+
+def test_once_busy_activity_lock_rejects_immediately(env):
+    write_state(env)
+    holder = os.open(str(env["lock"]), os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    result = []
+
+    def claim():
+        try:
+            with coordination.claim_guard(once=True):
+                result.append("claimed")
+        except coordination.ClaimAborted as exc:
+            result.append(exc.reason)
+
+    thread = threading.Thread(target=claim)
+    started = time.monotonic()
+    thread.start()
+    try:
+        thread.join(0.5)
+        assert not thread.is_alive(), "--once must not wait for a busy lock"
+        assert time.monotonic() - started < 0.5
+        assert result == ["gate-closed"]
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+        thread.join(1)
 
 
 def test_gate_matrix_matches_spec(env):

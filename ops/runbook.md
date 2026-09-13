@@ -305,15 +305,34 @@ write access:
       `systemctl is-active/is-enabled` for every pareton unit and timer;
       `systemctl --version`, each unit's effective
       `TimeoutStopUSec`/`KillMode` and `shutdown.target` properties (§8.1).
-   b. `systemctl disable --now pareton-deploy.timer`, then WAIT for any
-      running `pareton-deploy.service` to finish (`systemctl status`) —
-      the old deploy is the only writer of the ops files and the venv, so
-      the backup below must not race it.
+   b. Save the maintenance timer schedule before stopping it, then stop all
+      three maintenance timers and wait for any already-running oneshot and
+      deploy service to finish:
+
+      ```sh
+      TIMER_STATE=/var/lib/pareton-deploy/bootstrap-timers.env
+      install -d -m 0750 "$(dirname "$TIMER_STATE")"
+      for unit in pareton-deploy.timer pareton-gpu-reap.timer pareton-builder-cleanup.timer; do
+        printf '%s %s %s\n' "$unit" \
+          "$(systemctl is-enabled "$unit" 2>/dev/null || true)" \
+          "$(systemctl is-active "$unit" 2>/dev/null || true)"
+      done > "$TIMER_STATE"
+      systemctl disable --now pareton-deploy.timer pareton-gpu-reap.timer pareton-builder-cleanup.timer
+      while systemctl is-active --quiet pareton-deploy.service \
+          || systemctl is-active --quiet pareton-gpu-reap.service \
+          || systemctl is-active --quiet pareton-builder-cleanup.service; do
+        sleep 2
+      done
+      ```
+
+      The old deploy is the only writer of the ops files and the venv, so the
+      backup below must not race it. Keep `TIMER_STATE` in this shell for the
+      success and failure restore steps below.
    c. Take the deploy lock for the whole manual window (spec 8 — a
       disabled timer does not stop a HUMAN `systemctl start
       pareton-deploy`): keep this shell session open and run
       `exec 9>/run/pareton-deploy.lock && flock 9`.
-      HOLD fd 9 through the backup and the manual installs of step 4.
+      HOLD fd 9 through the backup and the manual installs of step 5.
       Release it (`flock -u 9 && exec 9>&-`) BEFORE `sync-config apply`,
       the `request reset`, and any `systemctl start pareton-deploy.service`
       — all of them take this lock themselves, and a tick finding it held
@@ -325,9 +344,8 @@ write access:
       /etc/systemd/system/pareton-*.service* /etc/vector
       /var/lib/pareton-deploy/bootstrap-backup/ &&
       cp -a /opt/pareton/.venv /var/lib/pareton-deploy/bootstrap-backup/venv`.
-      Do NOT stop the gpu-reap/builder-cleanup timers here — the reset
-      flow's own quiescing stops them and restores them from its pre-stop
-      snapshot.
+      `git -C /opt/pareton rev-parse HEAD >
+      /var/lib/pareton-deploy/bootstrap-backup/checkout.sha`.
 2. Old-worker drain transition: give both workers a temporary drop-in with
    `KillMode=mixed` and a stop budget at least the current effective value
    (worker 4h, round-worker 8h); `systemctl daemon-reload` and verify the
@@ -336,37 +354,78 @@ write access:
    units to go inactive before touching the environment.
 3. Quiesce the remaining shared-environment users (API, watcher, weights)
    with `systemctl stop --no-block` and wait for them to go inactive.
-4. Remove the temporary worker drop-ins FIRST (`rm
+4. With every shared-environment user inactive, capture and check the fixed
+   stage-2 target before installing anything from the checkout:
+
+   ```sh
+   TARGET_SHA=<approved stage-2 commit>
+   test -z "$(git -C /opt/pareton status --porcelain --untracked-files=no)"
+   git -C /opt/pareton fetch origin main
+   test "$(git -C /opt/pareton rev-parse origin/main^{commit})" = "$TARGET_SHA"
+   git -C /opt/pareton checkout --detach "$TARGET_SHA"
+   test "$(git -C /opt/pareton rev-parse HEAD)" = "$TARGET_SHA"
+   ```
+
+   If any check fails, stop here and restore the old material from the
+   bootstrap backup; do not copy helpers from an unverified checkout.
+5. Remove the temporary worker drop-ins FIRST (`rm
    /etc/systemd/system/pareton-worker.service.d/<temp>.conf` — unmanaged
    drop-ins make `apply` refuse with `unexpected`) and `systemctl
    daemon-reload`. Still holding the deploy lock from step 1c, install the
-   stage-2 set by hand, helpers before units: `release.py`,
-   `ops_common.py`, `sync-config.py`, `notify-deploy-failure.py` into
-   `/usr/local/lib/pareton-ops/`; `ops/deploy.sh` to
-   `/usr/local/bin/pareton-deploy`. Then RELEASE the manual lock
+   stage-2 set by hand, helpers before units:
+
+   ```sh
+   install -d -m 0755 /usr/local/lib/pareton-ops
+   for f in release.py ops_common.py sync-config.py notify-deploy-failure.py; do
+     install -m 0755 /opt/pareton/ops/$f /usr/local/lib/pareton-ops/$f
+   done
+   install -m 0755 /opt/pareton/ops/deploy.sh /usr/local/bin/pareton-deploy
+   ```
+
+   Then RELEASE the manual lock
    (`flock -u 9 && exec 9>&-`) and run `sync-config apply` (it takes the
    lock itself; no release state exists yet, so the gate sees a fresh
    bootstrap) and `systemctl daemon-reload`; re-run `sync-config check`.
-5. Initialize under hold and verify:
+6. Initialize under hold and verify:
    `$R request reset --baseline-commit <SHA> --confirm-evidence "..." --operator NAME`
    then `systemctl start pareton-deploy.service` — the release drains,
    applies, re-execs, and verifies; the first verify fails exactly on
    `notification-acceptance-required`.
-6. Run the failure drill and register it (S3 below), then
+7. Run the failure drill and register it (S3 below), then
    `$R request verify` + one deploy run, and finally `request unpause
    --main-commit <SHA>`.
 
 If any step cannot complete, restore from
 `/var/lib/pareton-deploy/bootstrap-backup/` (helpers, units, vector
 config, and the full pre-bootstrap venv captured in step 1) — the old
-deploy script does not understand the new state, so recovery is manual
-per those backups.
+deploy script does not understand the new state, so recovery is manual per
+those backups. Before restarting anything, check out the pre-bootstrap
+commit from `bootstrap-backup/checkout.sha`, restore the old
+helpers/units/vector/venv, run `systemctl daemon-reload`, and keep the
+stage-2 state held. Restore the timer schedule only after the old
+environment is coherent:
+
+```sh
+restore_bootstrap_timers() {
+  while read -r unit enabled active; do
+    if [ "$enabled" = enabled ]; then systemctl enable "$unit"; else systemctl disable "$unit"; fi
+    if [ "$active" = active ]; then systemctl start "$unit"; else systemctl stop "$unit"; fi
+  done < "$TIMER_STATE"
+}
+restore_bootstrap_timers
+```
+
+Do not start a timer whose pre-bootstrap state was inactive.
+
+On success, finish the explicit `request unpause` first, then apply the same
+`restore_bootstrap_timers` procedure. This restores the schedule that was in
+force before bootstrap, including a deliberately disabled maintenance timer;
+it does not infer enablement from a unit file.
 
 After `request unpause`, verify the timers are really back:
 `systemctl is-active pareton-deploy.timer pareton-gpu-reap.timer
-pareton-builder-cleanup.timer` (unpause re-enables the deploy timer by
-design; the maintenance timers are restored by the verified release from
-its pre-stop snapshot).
+pareton-builder-cleanup.timer` (the deploy and maintenance timers now match
+the saved schedule).
 
 ## S5. What looks like failure but is not
 
