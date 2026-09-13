@@ -1707,13 +1707,6 @@ def tick_continue(op_id: str) -> int:
 
 def tick_verifying_resume(state: dict) -> int:
     """A tick found phase=verifying with startup complete."""
-    if state.get("failure_step") == "health-check-failed":
-        # A finished-but-failed verification is the "running, unaccepted"
-        # steady state (spec 4.2): business continues, automatic re-verify
-        # would re-run the GPU probe and Axiom loop every tick; wait for the
-        # explicit verify / rollback / vector-repair instead.
-        record_step("log-unaccepted", {"detail": state["failure_step"]})
-        return 0
     if state.get("startup_complete") is not True:
         failure_step = "verifying-partial-startup"
         mutate_state(
@@ -1732,6 +1725,7 @@ def tick_verifying_resume(state: dict) -> int:
         "log-ingestion",
         "axiom-query",
         "notification-acceptance-required",
+        "health-check-failed",
         "gpu-reap-wait-timeout",
         "vector-repair-install-failed",
     ):
@@ -1782,7 +1776,6 @@ def _mark_health_check_failed() -> None:
         lambda s: s.update(
             {
                 "phase": "verifying",
-                "startup_complete": False,
                 "log_accepted": False,
                 "failure_step": failure_step,
             }

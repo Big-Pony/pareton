@@ -1620,13 +1620,83 @@ def test_verify_rechecks_current_health_before_logs(base, monkeypatch):
     assert checked == ["pareton-api"]
     state = read_state(base)
     assert state["verified_commit"] == "A"
-    assert state["startup_complete"] is False
+    assert state["startup_complete"] is True
     assert state["failure_step"] == "health-check-failed"
     assert release.tick([]) == 0
     state = read_state(base)
     assert state["failure_step"] == "health-check-failed"
     run_state = (base / "var/lib/pareton-deploy/last-run.env").read_text()
     assert "last_step=log-unaccepted" in run_state
+
+
+def test_verify_health_failure_can_be_reverified_after_recovery(base, monkeypatch):
+    write_state(
+        base,
+        phase="verifying",
+        target_commit="B",
+        verified_commit="A",
+        startup_complete=True,
+    )
+    health_results = iter((False, False, True))
+    checked = []
+    monkeypatch.setattr(
+        release,
+        "_current_environment_healthy",
+        lambda: checked.append(next(health_results)) or checked[-1],
+    )
+    monkeypatch.setattr(release, "gpu_probe_flow", lambda *_args: None)
+    logged_targets = []
+    monkeypatch.setattr(
+        release,
+        "run_log_check",
+        lambda probe, **_kwargs: (
+            logged_targets.append(probe["target_commit"]) or (0, {"missing": []})
+        ),
+    )
+    service_actions = []
+    monkeypatch.setattr(
+        release, "start_unit", lambda unit: service_actions.append(("start", unit))
+    )
+    monkeypatch.setattr(
+        release, "stop_unit", lambda unit: service_actions.append(("stop", unit))
+    )
+
+    assert release.cmd_request(["verify", "--operator", "o"]) == 0
+    assert release.tick([]) == 2
+    request = json.loads(
+        (base / "var/lib/pareton-deploy/release-request.json").read_text()
+    )
+    assert request["status"] == "failed"
+    state = read_state(base)
+    assert state["startup_complete"] is True
+    assert state["failure_step"] == "health-check-failed"
+
+    assert release.tick([]) == 0
+    assert read_state(base)["failure_step"] == "health-check-failed"
+
+    assert release.cmd_request(["verify", "--operator", "o"]) == 0
+    assert release.tick([]) == 2
+    request = json.loads(
+        (base / "var/lib/pareton-deploy/release-request.json").read_text()
+    )
+    assert request["status"] == "failed"
+    assert read_state(base)["verified_commit"] == "A"
+    business_units = {
+        *(f"{unit}.service" for unit in release.RESIDENT_UNITS),
+        *(f"{unit}.service" for unit in release.WORKER_UNITS),
+    }
+    assert [action for action in service_actions if action[1] in business_units] == []
+
+    assert release.cmd_request(["verify", "--operator", "o"]) == 0
+    assert release.tick([]) == 0
+    request = json.loads(
+        (base / "var/lib/pareton-deploy/release-request.json").read_text()
+    )
+    state = read_state(base)
+    assert request["status"] == "done"
+    assert (state["phase"], state["verified_commit"]) == ("idle", "B")
+    assert checked == [False, False, True]
+    assert logged_targets == ["B"]
 
 
 def test_vector_fast_path_rechecks_current_health_before_logs(base, monkeypatch):
@@ -1660,6 +1730,7 @@ def test_vector_fast_path_rechecks_current_health_before_logs(base, monkeypatch)
         "B",
     )
     assert state["verified_commit"] == "c1"
+    assert state["startup_complete"] is True
     assert state["failure_step"] == "health-check-failed"
 
 
@@ -1709,6 +1780,7 @@ def test_vector_repair_rechecks_current_health_before_logs(base, monkeypatch):
         "A",
     )
     assert state["failure_step"] == "health-check-failed"
+    assert state["startup_complete"] is True
     request = json.loads(
         (base / "var/lib/pareton-deploy/release-request.json").read_text()
     )
