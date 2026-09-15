@@ -811,181 +811,176 @@ def run_bench_on_pod(
 
     static_prepared = False
     static_claimed = False
-    with ExitStack() as resources:
-        try:
-            if pod_name:
-                entry = registry.get(pod_name)
-                if entry is None:
-                    raise ProvisionError(f"unknown pod {pod_name!r} in registry")
-                pod = _pod_from_entry(entry)
-                logger.info("reusing pod %s", pod.name)
-            else:
-                # provider=None: provision_pod walks the configured fallback order
-                # and destroy_pod later resolves the real provider from pod.provider.
-                phase(BenchPhase.PROVISIONING.value)
-                pod = provision_pod(
-                    spec,
-                    registry=registry,
-                    provider=provider,
-                    state_dir=registry.state_dir,
+    resources = ExitStack()
+    try:
+        if pod_name:
+            entry = registry.get(pod_name)
+            if entry is None:
+                raise ProvisionError(f"unknown pod {pod_name!r} in registry")
+            pod = _pod_from_entry(entry)
+            logger.info("reusing pod %s", pod.name)
+        else:
+            # provider=None: provision_pod walks the configured fallback order
+            # and destroy_pod later resolves the real provider from pod.provider.
+            phase(BenchPhase.PROVISIONING.value)
+            pod = provision_pod(
+                spec,
+                registry=registry,
+                provider=provider,
+                state_dir=registry.state_dir,
+            )
+        if pod.provider == "static_ssh":
+            target = f"{pod.ssh.host}:{pod.ssh.port}"
+            token = hashlib.sha256(target.encode()).hexdigest()
+            try:
+                resources.enter_context(
+                    host_lock(registry.state_dir / f"static-{token}.lock")
                 )
-            if pod.provider == "static_ssh":
-                target = f"{pod.ssh.host}:{pod.ssh.port}"
-                token = hashlib.sha256(target.encode()).hexdigest()
-                try:
-                    resources.enter_context(
-                        host_lock(registry.state_dir / f"static-{token}.lock")
-                    )
-                except RuntimeError as exc:
-                    raise GpuError(str(exc)) from exc
-                # A harness surviving its SSH client must finish before bootstrap
-                # rewrites its Python environment or cleanup touches its containers.
-                ssh_exec(
-                    pod,
-                    f"if test -e {REMOTE_LOCK}; then flock -w 120 {REMOTE_LOCK} true || "
-                    "{ echo 'static GPU host is busy or its lock is unavailable' >&2; "
-                    "exit 1; }; fi",
-                    timeout_s=150.0,
-                    runner=runner,
-                    state_dir=registry.state_dir,
-                )
-                static_claimed = True
-            phase(BenchPhase.BOOTSTRAPPING.value)
-            code_sha = bootstrap_pod(
+            except RuntimeError as exc:
+                raise GpuError(str(exc)) from exc
+            # A harness surviving its SSH client must finish before bootstrap
+            # rewrites its Python environment or cleanup touches its containers.
+            ssh_exec(
                 pod,
+                f"if test -e {REMOTE_LOCK}; then flock -w 120 {REMOTE_LOCK} true || "
+                "{ echo 'static GPU host is busy or its lock is unavailable' >&2; "
+                "exit 1; }; fi",
+                timeout_s=150.0,
+                runner=runner,
+                state_dir=registry.state_dir,
+            )
+            static_claimed = True
+        phase(BenchPhase.BOOTSTRAPPING.value)
+        code_sha = bootstrap_pod(
+            pod,
+            repo_root=repo_root,
+            runner=runner,
+            state_dir=registry.state_dir,
+        )
+        _write_remote_env(pod, runner=runner, state_dir=registry.state_dir)
+
+        refs = list(
+            dict.fromkeys(
+                ref for _, _, req, _ in preflighted for ref in _engine_image_refs(req)
+            )
+        )
+        if pod.provider == "static_ssh":
+            baselines = {
+                str(req.engines.baseline.image) for _, _, req, _ in preflighted
+            }
+            _static_host_cleanup(
+                pod,
+                candidates=set(refs) - baselines,
+                keep=set(refs),
+                runner=runner,
+                state_dir=registry.state_dir,
+            )
+            static_prepared = True
+
+        if not mock_engine:
+            phase(BenchPhase.PULLING_IMAGE.value)
+            pull_engine_images(
+                pod,
+                refs,
+                env_file=REMOTE_ENV,
+                runner=runner,
+                state_dir=registry.state_dir,
+            )
+
+        mock_flag = " --mock-engine" if mock_engine else ""
+        for job_index, (req_p, local_out, _req, trace_path) in enumerate(
+            preflighted, start=1
+        ):
+            local_out.mkdir(parents=True, exist_ok=True)
+            if pool or repetitions > 1:
+                run_name = local_out.name
+                remote_out = f"{REMOTE_OUT}/{run_name}"
+            else:
+                remote_out = REMOTE_OUT
+
+            if pod.provider == "static_ssh":
+                # A unique path prevents the phase poller from reading an old
+                # round's beacons or report while this round starts.
+                remote_out = f"{REMOTE_OUT}/static-{pod.name}/run-{job_index:03d}"
+
+            _push_remote_request(
+                pod,
+                request_path=req_p,
+                trace_path=trace_path,
+                local_out=local_out,
                 repo_root=repo_root,
                 runner=runner,
                 state_dir=registry.state_dir,
             )
-            _write_remote_env(pod, runner=runner, state_dir=registry.state_dir)
 
-            baselines = {
-                str(req.engines.baseline.image) for _, _, req, _ in preflighted
-            }
-            all_refs = {
-                ref for _, _, req, _ in preflighted for ref in _engine_image_refs(req)
-            }
+            bench_cmd = (
+                f"cd {REMOTE_REPO} && set -a && . {REMOTE_ENV} && set +a && "
+                f"export PARETON_BENCH_CODE_SHA={code_sha} && "
+                f"mkdir -p {shlex.quote(remote_out)} && "
+                f"{REMOTE_VENV}/bin/python -m bench "
+                f"--request {REMOTE_REQUEST} --output-dir {shlex.quote(remote_out)}{mock_flag}"
+            )
             if pod.provider == "static_ssh":
-                _static_host_cleanup(
-                    pod,
-                    candidates=all_refs - baselines,
-                    keep=all_refs,
-                    runner=runner,
-                    state_dir=registry.state_dir,
+                limit = float(
+                    config.BENCH_TIMEOUT_S
+                    if bench_timeout_s is None
+                    else bench_timeout_s
                 )
-                static_prepared = True
-
-            if not mock_engine:
-                refs: list[str] = []
-                for _req_p, _local_out, req, _trace in preflighted:
-                    for ref in _engine_image_refs(req):
-                        if ref not in refs:
-                            refs.append(ref)
-                phase(BenchPhase.PULLING_IMAGE.value)
-                pull_engine_images(
-                    pod,
-                    refs,
-                    env_file=REMOTE_ENV,
-                    runner=runner,
-                    state_dir=registry.state_dir,
-                )
-
-            mock_flag = " --mock-engine" if mock_engine else ""
-            for job_index, (req_p, local_out, _req, trace_path) in enumerate(
-                preflighted, start=1
-            ):
-                local_out.mkdir(parents=True, exist_ok=True)
-                if pool or repetitions > 1:
-                    run_name = local_out.name
-                    remote_out = f"{REMOTE_OUT}/{run_name}"
-                else:
-                    remote_out = REMOTE_OUT
-
-                if pod.provider == "static_ssh":
-                    # A unique path prevents the phase poller from reading an old
-                    # round's beacons or report while this round starts.
-                    remote_out = f"{REMOTE_OUT}/static-{pod.name}/run-{job_index:03d}"
-
-                _push_remote_request(
-                    pod,
-                    request_path=req_p,
-                    trace_path=trace_path,
-                    local_out=local_out,
-                    repo_root=repo_root,
-                    runner=runner,
-                    state_dir=registry.state_dir,
-                )
-
+                # Bound the remote process too: a dead SSH client must not leave
+                # a harness running indefinitely on a paid static machine.
                 bench_cmd = (
-                    f"cd {REMOTE_REPO} && set -a && . {REMOTE_ENV} && set +a && "
-                    f"export PARETON_BENCH_CODE_SHA={code_sha} && "
-                    f"mkdir -p {shlex.quote(remote_out)} && "
-                    f"{REMOTE_VENV}/bin/python -m bench "
-                    f"--request {REMOTE_REQUEST} --output-dir {shlex.quote(remote_out)}{mock_flag}"
+                    f"timeout --signal=TERM --kill-after=30s {limit:g}s "
+                    f"flock -w 120 {REMOTE_LOCK} sh -c {shlex.quote(bench_cmd)}"
                 )
-                if pod.provider == "static_ssh":
-                    limit = float(
+            # ssh exec does not stream; poll the harness marker while it blocks.
+            poller = _PodPhasePoller(
+                pod,
+                remote_out=remote_out,
+                on_phase=phase,
+                runner=runner,
+                state_dir=registry.state_dir,
+                on_entry_status=on_entry_status,
+            )
+            with poller:
+                result = ssh_exec(
+                    pod,
+                    bench_cmd,
+                    timeout_s=float(
                         config.BENCH_TIMEOUT_S
                         if bench_timeout_s is None
                         else bench_timeout_s
-                    )
-                    # Bound the remote process too: a dead SSH client must not leave
-                    # a harness running indefinitely on a paid static machine.
-                    bench_cmd = (
-                        f"timeout --signal=TERM --kill-after=30s {limit:g}s "
-                        f"flock -w 120 {REMOTE_LOCK} sh -c {shlex.quote(bench_cmd)}"
-                    )
-                # ssh exec does not stream; poll the harness marker while it blocks.
-                poller = _PodPhasePoller(
-                    pod,
-                    remote_out=remote_out,
-                    on_phase=phase,
+                    ),
                     runner=runner,
                     state_dir=registry.state_dir,
-                    on_entry_status=on_entry_status,
+                    check=False,
                 )
-                with poller:
-                    result = ssh_exec(
-                        pod,
-                        bench_cmd,
-                        timeout_s=float(
-                            config.BENCH_TIMEOUT_S
-                            if bench_timeout_s is None
-                            else bench_timeout_s
-                        ),
-                        runner=runner,
-                        state_dir=registry.state_dir,
-                        check=False,
-                    )
-                # The ssh return can beat the last poll interval; read the entry
-                # beacon one final time so a fast terminal failure still lands.
-                poller.final_read()
-                if result.stdout:
-                    print(
-                        result.stdout, end="" if result.stdout.endswith("\n") else "\n"
-                    )
-                if result.stderr:
-                    print(
-                        result.stderr, end="" if result.stderr.endswith("\n") else "\n"
-                    )
+            # The ssh return can beat the last poll interval; read the entry
+            # beacon one final time so a fast terminal failure still lands.
+            poller.final_read()
+            if result.stdout:
+                print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+            if result.stderr:
+                print(result.stderr, end="" if result.stderr.endswith("\n") else "\n")
 
-                try:
-                    pull(
-                        pod,
-                        f"{remote_out}/",
-                        local_out,
-                        runner=runner,
-                        state_dir=registry.state_dir,
-                    )
-                except GpuError as exc:
-                    logger.warning("failed to pull bench output: %s", exc)
+            try:
+                pull(
+                    pod,
+                    f"{remote_out}/",
+                    local_out,
+                    runner=runner,
+                    state_dir=registry.state_dir,
+                )
+            except GpuError as exc:
+                logger.warning("failed to pull bench output: %s", exc)
 
-                exit_code = int(result.exit_code)
-                if exit_code != 0:
-                    break
-        except BaseException as exc:
-            pending = exc
-        finally:
+            exit_code = int(result.exit_code)
+            if exit_code != 0:
+                break
+    except BaseException as exc:
+        pending = exc
+    finally:
+        # Release the local host lock even if teardown itself raises.
+        with resources:
             if pod is not None and (pod.provider != "static_ssh" or static_claimed):
                 if static_prepared:
                     try:

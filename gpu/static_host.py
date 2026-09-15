@@ -42,10 +42,7 @@ def host_lock(path: Path) -> Iterator[None]:
             raise HostBusyError(
                 "static GPU host is busy with another Pareton run"
             ) from exc
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+        yield  # Closing the file releases the lock, including on exceptions.
 
 
 def _docker(*args: str) -> subprocess.CompletedProcess:
@@ -135,21 +132,20 @@ def cleanup(
         else set()
     )
     cleanup_containers(docker=docker)
-    remaining = set(tracked)
     failures = []
     for ref in sorted(tracked - keep):
         try:
             docker("image", "rm", ref)
         except RuntimeError as exc:
             if "No such image" in str(exc):
-                remaining.discard(ref)
+                tracked.discard(ref)
             else:
                 failures.append(str(exc))
         else:
-            remaining.discard(ref)
-    remaining.update(candidates)
+            tracked.discard(ref)
+    tracked.update(candidates)
     tmp = tracked_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(sorted(remaining)) + "\n")
+    tmp.write_text(json.dumps(sorted(tracked)) + "\n")
     tmp.replace(tracked_path)
     if output_root.is_dir():
         for child in output_root.iterdir():

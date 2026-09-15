@@ -209,7 +209,8 @@ journalctl -u pareton-builder-cleanup.service -n 100 --no-pager
 
 ## Use a fixed GPU machine
 
-Configure the existing provider mode in the validator's `.env`:
+Set the existing provider mode in the validator's `.env`, then restart
+`pareton-round-worker` after its current round finishes:
 
 ```dotenv
 PARETON_GPU_PROVIDERS=static_ssh
@@ -217,89 +218,57 @@ PARETON_GPU_STATIC_SSH=user@host:port
 PARETON_GPU_SSH_KEY_PATH=/path/to/key
 ```
 
-Restart `pareton-round-worker` after its current round finishes. Use a dedicated
-Linux node with NVIDIA drivers, SSH access and passwordless sudo when the SSH
-user is not root. One validator should own this node. Worker processes on that
-validator must share `PARETON_GPU_STATE_DIR` so they use the same host lock.
-The bootstrap still recreates the remote Python environment each round.
+Use a dedicated Linux/NVIDIA node with SSH and passwordless sudo for non-root
+users. One validator owns the node; its workers must share `PARETON_GPU_STATE_DIR`.
+Bootstrap still recreates the remote Python environment each round.
 
 ### Campaigns and rental ownership
 
-This setting routes every campaign to the same host. Before switching to a 5090
-node, close the H200 campaign and finish its pending/running rounds on compatible
-hardware. **Closing a campaign alone does not drain its existing queue.** Static
-provisioning probes `nvidia-smi` and rejects mismatched models, mixed GPU models,
-or insufficient GPU counts before evaluation. A larger matching node is allowed,
-but the worker logs its unused GPU count. Rent a 4-GPU node for a campaign pinned
-to 4 GPUs; changing the campaign's GPU count changes its benchmark configuration.
+- Every campaign uses this host. Before switching to a 5090, close incompatible
+  campaigns and finish their pending/running rounds on compatible hardware.
+  **Closing a campaign does not drain its queue.** Provisioning rejects wrong or
+  mixed GPU models and insufficient counts; oversized nodes log unused GPUs.
+- Static mode never releases the rental, even at campaign closure. Release it
+  manually. Prefer a 4-GPU node for a 4-GPU campaign.
+- Use operator-managed rental and volume names. **Retire TTL management before
+  reusing a `pt-<timestamp>-<ttl>h-*` rental:** the existing reaper still scans cloud
+  providers for those names, even when `PARETON_GPU_PROVIDERS=static_ssh`.
 
-Static mode never cancels the Lium rental, including at campaign closure. Release
-the machine manually when it is no longer needed. Use an operator-managed name
-for both the rental and its volume. **Do not repurpose a `pt-<timestamp>-<ttl>h-*`
-rental without retiring its TTL management first:** the reaper still scans cloud
-providers for those names, even when `GPU_PROVIDERS=static_ssh`. Static SSH entries
-are skipped, but that does not exempt a separately listed cloud rental.
+### Housekeeping and recovery
 
-### Automatic housekeeping
+Each round removes abandoned Pareton bench containers, anonymous volumes and
+networks before image pulls, then removes candidate images and temporary outputs
+after collecting results. Only Pareton bench names and candidate references in
+`/opt/pareton/.static-host-images.json` are reclaimed. Keep this ledger across
+restarts; failed image deletions remain tracked for retry. Current baseline
+images, model downloads and baseline compile caches are preserved. Inspect older,
+untracked images separately. No separate daily image-pruning job is needed.
 
-Before pulling images, each static run removes abandoned `pareton-bench-<run-id>`
-containers and networks. Container removal includes anonymous volumes. It also
-removes obsolete candidate images recorded by previous runs. After collecting
-the result, it removes the current candidate images and its temporary remote
-output directory. The candidate image tracking file is
-`/opt/pareton/.static-host-images.json`; keep it across worker restarts. Failed
-image deletions remain tracked for retry and produce a cleanup failure.
+Local locking prevents overlapping workers. Remote locking protects active
+harnesses from cleanup and prevents bootstrap over a surviving harness. A remote
+harness has the configured benchmark timeout plus a 30-second kill grace period;
+a new harness waits up to 120 seconds for maintenance.
 
-Cleanup is limited to Pareton bench names and recorded image references. Baseline
-images for the current requests, `/workspace/hf-cache`, and
-`/workspace/engine-cache` are preserved. Candidate containers do not mount the
-shared compile cache; normal container teardown also removes anonymous volumes.
-Inspect images left from runs predating this tracking file separately before
-removing them. Automatic reclamation runs with every round, so candidate images
-from ongoing work do not need a separate daily pruning job.
+The existing **`pareton-gpu-reap.timer` runs on the validator VPS every 10 minutes**
+and SSHes to the configured node. Enable it and deploy updated code on both hosts
+(normal bootstrap uploads GPU-side code). It skips active harnesses, removes
+orphan Pareton containers/networks, then checks NVIDIA compute PIDs, allowing two
+seconds for process exit. It leaves images and reports untouched while a worker
+may be downloading results, and works even with a corrupt image ledger.
 
-A local host lock prevents overlapping workers; a remote lock protects the
-harness from housekeeping. Bootstrap refuses a host whose previous harness is
-still active. The remote harness has the same time limit as its SSH invocation,
-with a 30-second forced-kill grace period. After a worker crash or timeout, the
-next run or periodic reaper reclaims abandoned containers once the prior harness
-has exited. A new harness waits up to 120 seconds for brief maintenance to finish.
+Remaining GPU processes, failed inspection or SSH failure emit
+`static_host_cleanup_failed` and fail the reaper run. The timer requires a running
+validator and reachable node. It cannot reset the GPU driver or kill unrelated
+processes, and its check does not require zero reported VRAM. Validate crash
+recovery on the actual node before relying on unattended cleanup.
 
-The existing `pareton-gpu-reap.timer` also checks a configured static host every
-10 minutes, independently of the round worker. It takes the remote host lock,
-skips active harnesses, removes idle Pareton containers/networks, and checks
-`nvidia-smi --query-compute-apps=pid` for remaining GPU compute processes. It
-allows two seconds for process exit before reporting a failure. This periodic
-path leaves image tracking and output files untouched, so it cannot delete a
-report that the worker is still downloading or depend on a valid image ledger.
-Remaining processes, an unreachable host or failed GPU inspection emit
-`static_host_cleanup_failed` and fail the reaper run for monitoring.
+### Alerts
 
-Deploy the updated code on the validator and GPU node (normal bootstrap uploads
-it), and ensure `pareton-gpu-reap.timer` is enabled on the validator. Its service
-reads the static SSH target/key from the same `.env`. This handles worker failure
-while the validator and SSH remain reachable. If the whole validator is down,
-its timer cannot run. A live harness keeps its lock until exit or its configured
-timeout; periodic cleanup deliberately leaves it running.
-
-Container process termination normally frees its GPU allocations. The check
-confirms that compute processes are gone; it does not require zero reported VRAM,
-reset the GPU driver, or kill unrelated processes. Driver failures or memory held
-outside managed containers require operator investigation. Validate crash
-recovery on the actual node before relying on this unattended.
-
-### Failed-round and cleanup alerts
-
-There is no cloud fallback when the configured provider is only `static_ssh`.
-An unreachable or incompatible host voids the round and emits `round_voided`.
-Cleanup failure after an otherwise successful round emits
-`static_host_cleanup_failed`, so a valid score is retained while disk cleanup
-still receives attention.
-
-Create an Axiom monitor using this query, the existing operations notifier,
-**Above 0 over 5 minutes**, and evaluation every minute. This is an event-count
-alert; keep **Alert on no data** off and retain the separate worker heartbeat
-alerts above.
+There is no cloud fallback with only `static_ssh` configured. Failed rounds emit
+`round_voided`; post-round cleanup failures emit `static_host_cleanup_failed`
+without discarding a valid score. Create an Axiom monitor with the existing
+operations notifier, **Above 0 over 5 minutes**, evaluated every minute, and
+**Alert on no data** off. Keep the separate worker heartbeat alerts above.
 
 ```apl
 ['pareton-prod']
@@ -309,7 +278,5 @@ alerts above.
 | summarize count()
 ```
 
-Investigate the failed round's detail and `pareton-round-worker` journal, restore
-SSH/GPU access or resolve cleanup errors, then resume work on compatible hardware.
-The query and event emission are versioned here; the monitor and its notifier
-must be activated in Axiom during deployment.
+Activate the monitor/notifier during rollout; code deployment does not create it.
+Investigate failures in `pareton-round-worker` and `pareton-gpu-reap` journals.

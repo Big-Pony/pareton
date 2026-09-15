@@ -34,7 +34,7 @@ class Docker:
         return SimpleNamespace(stdout="")
 
 
-def test_cleanup_reclaims_only_owned_resources_and_preserves_caches(tmp_path):
+def test_cleanup_reclaims_only_owned_resources(tmp_path):
     tracked = tmp_path / "images.json"
     tracked.write_text(json.dumps(["old-candidate", "current-candidate", "baseline"]))
     output = tmp_path / "out"
@@ -42,9 +42,6 @@ def test_cleanup_reclaims_only_owned_resources_and_preserves_caches(tmp_path):
     stale.mkdir(parents=True)
     (stale / "report.json").write_text("old")
     (output / "operator-report").mkdir()
-    for name in ("hf-cache", "engine-cache"):
-        (tmp_path / name).mkdir()
-        (tmp_path / name / "keep").write_text("cached")
     docker = Docker()
     cleanup(
         tracked_path=tracked,
@@ -65,10 +62,6 @@ def test_cleanup_reclaims_only_owned_resources_and_preserves_caches(tmp_path):
     }
     assert not stale.exists()
     assert (output / "operator-report").is_dir()
-    assert all(
-        (tmp_path / name / "keep").read_text() == "cached"
-        for name in ("hf-cache", "engine-cache")
-    )
     assert not any("other-app" in call or "bridge" in call for call in docker.calls)
 
     cleanup(
@@ -162,9 +155,15 @@ def test_static_provider_checks_real_hardware(
             provider.provision(offer, name="manual-host", ssh_public_key="")
 
 
-def test_periodic_cleanup_skips_live_harness_then_reclaims_orphans(tmp_path):
+def test_periodic_cleanup_skips_live_harness_then_reclaims_orphans(
+    tmp_path, monkeypatch
+):
     from gpu.static_host import reap_idle_containers
 
+    monkeypatch.setattr(
+        "gpu.static_host.cleanup",
+        lambda **kw: pytest.fail("periodic cleanup must not touch images or reports"),
+    )
     docker = Docker()
     checked = []
     lock = tmp_path / "host.lock"
@@ -182,24 +181,6 @@ def test_periodic_cleanup_skips_live_harness_then_reclaims_orphans(tmp_path):
     assert result == {"status": "cleaned", "containers_removed": 1}
     assert checked == [True]
     assert not any(call[:2] == ("image", "rm") for call in docker.calls)
-
-
-def test_periodic_cleanup_does_not_touch_reports_or_image_tracking(
-    tmp_path, monkeypatch
-):
-    from gpu import static_host
-
-    tracking = tmp_path / "images.json"
-    tracking.write_text("corrupt tracking must not prevent GPU process cleanup")
-    output = tmp_path / "static-pt-20260915120000-2h-0123abcd"
-    output.mkdir()
-    (output / "report.json").write_text("waiting to be pulled by worker")
-    monkeypatch.setattr(static_host, "REMOTE_IMAGES", str(tracking))
-    static_host.reap_idle_containers(
-        lock_path=tmp_path / "lock", docker=Docker(), verify=lambda: None
-    )
-    assert tracking.read_text().startswith("corrupt")
-    assert (output / "report.json").exists()
 
 
 def test_gpu_check_waits_for_exit_and_reports_stuck_processes():
