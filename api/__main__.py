@@ -19,4 +19,5 @@ if __name__ == "__main__":
     threading.Thread(
         target=obs_probe.run_probe_loop, args=("pareton-api",), daemon=True
     ).start()
-    uvicorn.run("api.server:app", host="0.0.0.0", port=8000, reload=False)
+    # Caddy is the public entry point; never expose the backend directly.
+    uvicorn.run("api.server:app", host="127.0.0.1", port=8000, reload=False)

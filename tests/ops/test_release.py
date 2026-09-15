@@ -167,6 +167,16 @@ def read_state(base: Path) -> dict:
     return json.loads((base / "var/lib/pareton-deploy/release-state.json").read_text())
 
 
+def test_probe_readable_by_api_while_release_state_stays_private(base):
+    write_state(base)
+    for probe_id in ("first", "replacement"):
+        release.write_probe(probe_id, "c1")
+        probe = base / "run/pareton-deploy/probe.json"
+        assert probe.stat().st_mode & 0o777 == 0o644
+        assert json.loads(probe.read_text())["probe_id"] == probe_id
+    assert release.state_path().stat().st_mode & 0o777 == 0o600
+
+
 def write_vector_toml(base: Path, units=None):
     units = units or [
         "pareton-worker",

@@ -65,6 +65,41 @@ def test_default_seed_pins_hf_rows_and_stores_no_trace(
     assert public["sampling_rule"]["type"] == "hf_rows"
 
 
+def test_trajectory_coverage_is_required_before_open_campaign_is_written(monkeypatch):
+    from bench.sampler import SamplerError
+
+    captured = _patch_store(monkeypatch)
+    rule = json.loads(FIXTURE_SAMPLING_RULE.read_text())
+    rule.update(
+        algo_version=3,
+        request_interval_ms=0,
+        enable_thinking=True,
+        n_prompts=4,
+        n_rows=32,
+        revision="a" * 40,
+    )
+
+    def unavailable(*args):
+        raise SamplerError("trajectory input-length coverage unavailable")
+
+    monkeypatch.setattr(seed, "preflight_trajectory_campaign", unavailable)
+    with pytest.raises(SamplerError, match="coverage unavailable"):
+        seed_synthetic_campaign(
+            allow_placeholders=True,
+            status="open",
+            sampling_rule=rule,
+            bench_max_model_len=262144,
+            emission_rule={
+                "name": "linear_decay",
+                "start_weight": 0,
+                "floor_weight": 0,
+                "decay_blocks": 1,
+            },
+        )
+    assert captured["inserts"] == 0
+    assert captured["profile_data"] is None
+
+
 def test_sglang_seed_opens_zero_emission_campaign_with_valid_patch_surface(monkeypatch):
     from types import SimpleNamespace
 
@@ -167,10 +202,20 @@ def test_sglang_requires_source_pin_before_writing(monkeypatch):
 
 
 def test_sglang_launch_helper_produces_fp8_worker_request(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from bench.trajectory import length_groups
     from bench.validate import sha256_file
     from worker.round_job import build_round_request
 
     captured = _patch_store(monkeypatch)
+    preflight = []
+
+    def preview(*args):
+        preflight.append(args)
+        return SimpleNamespace(receipt={"length_groups": length_groups(32)})
+
+    monkeypatch.setattr(seed, "preflight_trajectory_campaign", preview)
     engine_ref = "ghcr.io/pareton-ai/pareton-baseline@" + REAL_ENGINE
     helper = Path(__file__).resolve().parents[1] / "ops/seed-sglang-qwen38-27b.sh"
     # Expand the executable launch helper with Bash, intercepting its final CLI.
@@ -198,7 +243,7 @@ def test_sglang_launch_helper_produces_fp8_worker_request(monkeypatch, tmp_path)
     )
     request = build_round_request(
         {
-            "gpu_sku": "H200",
+            "gpu_sku": "RTX5090",
             "sampled_trace_sha256": sha256_file(tmp_path / "trace.json"),
             "scoring_rule": manifest.scoring_rule,
         },
@@ -212,34 +257,80 @@ def test_sglang_launch_helper_produces_fp8_worker_request(monkeypatch, tmp_path)
     )
     assert captured["inserts"] == 1
     assert manifest.status == "open"
-    assert (
-        manifest.emission_rule["start_weight"]
-        == manifest.emission_rule["floor_weight"]
-        == 0
-    )
+    assert manifest.emission_rule == {
+        "name": "linear_decay",
+        "start_weight": 0.1,
+        "floor_weight": 0.0,
+        "decay_blocks": 201600,
+    }
     assert manifest.allowed_paths == ["python/sglang/**", "rust/**"]
     assert "**/CMakeLists.txt" not in manifest.denied_paths
     assert manifest.engine["install_cmd"] == "/usr/local/bin/pareton-install-sglang"
     assert request["model"]["hf_repo"] == "Qwen/Qwen3.8-27B-FP8"
     assert request["model"]["hf_revision"] == "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
     assert request["model"]["quantization"] == "fp8"
+    assert request["model"]["max_model_len"] == 262144
+    assert request["hardware"]["gpu_count"] == 4
+    assert request["hardware"]["gpu_sku_expected"] == "RTX5090"
+    assert manifest.gpu_skus == ["RTX5090"]
+    assert manifest.sampling_rule["algo_version"] == 3
+    assert manifest.sampling_rule["n_prompts"] == 32
+    assert manifest.sampling_rule["max_tokens"] == 5120
+    assert manifest.sampling_rule["request_interval_ms"] == 2
+    assert manifest.sampling_rule["enable_thinking"] is True
+    assert manifest.scoring_rule["failure_penalty"] == 0.1
+    assert request["scoring_rule"] == manifest.scoring_rule
+    assert preflight == [(manifest.sampling_rule, manifest.bench, manifest.engine)]
+    example = json.loads(
+        (
+            helper.parent.parent
+            / "fixtures/campaigns/sglang_qwen38_27b/campaign-fields.json"
+        ).read_text()
+    )
+    for key in ("model", "gpu_count", "serve_args"):
+        assert example["bench"][key] == manifest.bench[key]
+    assert example["sampling_rule"] == manifest.sampling_rule
+    assert example["scoring_rule"] == manifest.scoring_rule
+    assert example["emission_rule"] == manifest.emission_rule
+    assert example["gpu_skus"] == manifest.gpu_skus
+    groups = length_groups(32)
+    assert [g["name"] for g in groups] == ["4k", "8k", "16k", "32k"]
+    assert [g["max_tokens"] for g in groups] == [4096, 8192, 16384, 32768]
+    assert [g["min_tokens"] for g in groups] == [3687, 7373, 14746, 29492]
+    assert [g["count"] for g in groups] == [8, 8, 8, 8]
+    assert all(g["max_tokens"] + 5120 + 2 <= 262144 for g in groups)
     baseline = request["engines"]["baseline"]
     assert baseline["name"] == "sglang"
+    assert request["engines"]["candidates"][0]["serve_args"] == baseline["serve_args"]
     assert baseline["serve_args"] == [
         "--model-path",
         "/model",
         "--context-length",
-        "8192",
+        "262144",
         "--dtype",
         "bfloat16",
         "--quantization",
         "fp8",
+        "--trust-remote-code",
+        "--served-model-name",
+        "qwen3.8-27b",
         "--tp-size",
-        "1",
+        "4",
         "--mem-fraction-static",
-        "0.80",
+        "0.85",
+        "--attention-backend",
+        "flashinfer",
+        "--chunked-prefill-size",
+        "8192",
+        "--mamba-radix-cache-strategy",
+        "extra_buffer",
         "--max-running-requests",
-        "32",
+        "40",
+        "--reasoning-parser",
+        "qwen3",
+        "--tool-call-parser",
+        "qwen3_coder",
+        "--enable-cache-report",
     ]
 
 

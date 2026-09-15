@@ -81,6 +81,15 @@ must restore the venv from the recovery copy (marker gone), move the
 checkout and `.deploy-done` back to A, and keep the hold. Verified
 2026-09-12: 48/48 assertions pass (S8 included).
 
+The #159 integration also checks the real API unit's DynamicUser sandbox:
+only its startup gate can read private release state; the API cannot read
+that state or `.env`, cannot write the checkout, excludes query/registry
+credentials, and retains required S3 configuration. Existing verify and
+gate-matrix scenarios exercise readable probes without an API restart,
+valid-state startup, applying-state deferral, and corrupt-state failure.
+The API business handler remains a stand-in; this does not certify live
+signed uploads or production build-log permissions.
+
 ```sh
 docker run --privileged --cgroupns=host -d --name pareton-s2 pareton-systemd-verify
 # wait for "running", then stage the stage2 worktree WITHOUT its .git

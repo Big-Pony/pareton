@@ -192,6 +192,15 @@ activity lock) and every deployment write path. State lives in
 `/var/lib/pareton-deploy/release-state.json` (schema and gate matrix: spec
 section 4.5); `.deploy-done` is a compat alias rewritten from state.
 
+The API retains the loopback binding and DynamicUser sandbox from #159.
+Only its read-only `ExecCondition` uses the systemd `!` prefix to read the
+root-owned 0600 release state as root; filesystem/capability restrictions
+remain applied. The API process and `ExecStartPre` run as the dynamic user.
+`/run/pareton-deploy/probe.json` contains only correlation metadata and is
+atomically published as root-owned 0644 for those readers. Other release
+state remains 0600. Do not chmod the shared `.env` or all state files to
+make the API start. The API also excludes `PARETON_AXIOM_QUERY_TOKEN`.
+
 ## S0. Read-only checks (no window needed)
 
 ```sh

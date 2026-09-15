@@ -40,7 +40,14 @@ from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ops_common import now_iso, parse_env_file, parse_iso, read_json, write_json_atomic
+from ops_common import (
+    atomic_write,
+    now_iso,
+    parse_env_file,
+    parse_iso,
+    read_json,
+    write_json_atomic,
+)
 
 # tomllib is stdlib from Python 3.11 (spec 2.3: the ops interpreter is a
 # production install prerequisite). Without it the TOML paths degrade
@@ -545,7 +552,9 @@ def write_probe(probe_id: str, target: str) -> dict:
         "issued_at": now_iso(),
     }
     with state_lock():
-        write_json_atomic(probe_path(), probe)
+        # Public correlation metadata: the sandboxed API must read each new
+        # probe. All other release/credential state retains private 0600 mode.
+        atomic_write(probe_path(), json.dumps(probe).encode() + b"\n", 0o644)
     return probe
 
 

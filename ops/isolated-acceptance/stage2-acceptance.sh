@@ -103,6 +103,7 @@ PY
 cat > "$REPO/.venv/standins/api.py" <<'PY'
 import json
 import logging
+import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -113,6 +114,15 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
 )
 from observability.probe import run_probe_loop
+
+assert os.getuid() != 0, "API must retain DynamicUser"
+assert not os.access("/opt/pareton/.env", os.R_OK)
+assert not os.access("/var/lib/pareton-deploy/release-state.json", os.R_OK)
+assert not os.access("/opt/pareton", os.W_OK)
+assert "PARETON_AXIOM_QUERY_TOKEN" not in os.environ
+assert "PARETON_GHCR_TOKEN" not in os.environ
+assert os.environ["PARETON_S3_ACCESS_KEY"] == "synthetic-api-s3"
+print("api-sandbox-verified", flush=True)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -175,6 +185,9 @@ PY
 cat > "$REPO/.env" <<'ENV'
 PARETON_DISCORD_DEPLOY_WEBHOOK=https://pareton-isolated-test.invalid/webhook
 PARETON_AXIOM_TOKEN=isolated-test-token
+PARETON_AXIOM_QUERY_TOKEN=isolated-query-token
+PARETON_GHCR_TOKEN=isolated-registry-token
+PARETON_S3_ACCESS_KEY=synthetic-api-s3
 ENV
 chown root:root "$REPO/.env"
 chmod 0600 "$REPO/.env"
@@ -386,6 +399,9 @@ done
 http_ok() { python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000$1', timeout=5).status == 200 else 1)"; }
 http_ok /health && pass "S1 api /health ok" || fail "S1 api /health failed"
 http_ok /v1/campaigns && pass "S1 api /v1/campaigns ok" || fail "S1 api /v1/campaigns failed"
+journalctl -u pareton-api --no-pager | grep -q "api-sandbox-verified" \
+  && pass "S1 non-root API retains sandbox and filtered credentials" \
+  || fail "S1 API sandbox contract failed"
 
 echo "=== S2: failure drill + acceptance record + verify ==="
 # The drill must be a REAL deploy failure; under hold the tick is read-only,
@@ -440,6 +456,11 @@ chmod 0755 "$REPO/.venv/bin/stage2-a-era-marker"
   --operator isolated >/dev/null && pass "S3 unpause registered" || fail "S3 unpause refused"
 systemctl start pareton-deploy.service
 [ "$?" = 0 ] && pass "S3 unpause executed" || fail "S3 unpause deploy rc!=0"
+# The remaining scenarios drive ticks and mutate state explicitly. Confirm
+# unpause restored scheduling, then stop it so a timer cannot race the matrix.
+[ "$(systemctl is-active pareton-deploy.timer)" = active ] \
+  && pass "S3 unpause restored deploy timer" || fail "S3 deploy timer not active"
+systemctl stop pareton-deploy.timer
 systemctl start pareton-deploy.service
 RC=$?
 [ "$RC" = 0 ] && pass "S3 full release A->B (rc=0)" || fail "S3 release rc=$RC: $(journalctl -u pareton-deploy -n 40 --no-pager | tail -8)"
