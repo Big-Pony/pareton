@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -30,6 +31,18 @@ _OUTPUT = re.compile(r"^static-pt-\d{14}-[0-9]+(?:\.[0-9]+)?h-[0-9a-f]{8}$")
 
 class HostBusyError(RuntimeError):
     """An active harness owns this host; idle housekeeping must skip it."""
+
+
+def bounded_bench_command(command: str, *, output_dir: str, timeout_s: float) -> str:
+    """Keep the remote deadline alive after SSH hangs up or closes its pipes."""
+    return (
+        f"mkdir -p {shlex.quote(output_dir)} && "
+        f"exec nohup setsid --wait timeout --signal=TERM --kill-after=30s {timeout_s:g}s "
+        # No flock parent may exit on TERM before timeout can escalate to KILL.
+        f"flock --no-fork -w 120 -E {HOST_BUSY_EXIT} {shlex.quote(REMOTE_LOCK)} "
+        f"sh -c {shlex.quote(command)} "
+        f"> {shlex.quote(output_dir + '/supervisor.log')} 2>&1 < /dev/null"
+    )
 
 
 @contextmanager
@@ -174,13 +187,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.idle_containers:
         print(json.dumps(reap_idle_containers()))
         return 0
-    with host_lock(Path(REMOTE_LOCK)):
-        cleanup(
-            tracked_path=Path(REMOTE_IMAGES),
-            candidates=_image_refs(json.loads(args.candidates)),
-            keep=_image_refs(json.loads(args.keep)),
-            collected_output=args.collected_output,
-        )
+    try:
+        with host_lock(Path(REMOTE_LOCK)):
+            cleanup(
+                tracked_path=Path(REMOTE_IMAGES),
+                candidates=_image_refs(json.loads(args.candidates)),
+                keep=_image_refs(json.loads(args.keep)),
+                collected_output=args.collected_output,
+            )
+    except HostBusyError as exc:
+        logger.info("%s", exc)
+        return HOST_BUSY_EXIT
     return 0
 
 

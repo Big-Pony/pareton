@@ -251,9 +251,16 @@ untracked images separately. No separate daily image-pruning job is needed.
 Local locking prevents overlapping workers. Remote locking protects active
 harnesses from cleanup and prevents bootstrap over a surviving harness. Busy
 hosts defer the round using `PARETON_PROVISION_RETRY_S`, preserving its cohort and
-seed. SSH or lock-system failures still fail the round. A remote harness has the
+seed, including when the reaper takes the lock during bootstrap. SSH or
+lock-system failures still fail the round. A remote harness has the
 configured benchmark timeout plus a 30-second kill grace period; a new harness
 waits up to 120 seconds for maintenance, then defers if the lock remains held.
+The timeout and harness run in a separate session with output redirected to
+`supervisor.log` in the remote run directory, so SSH hangup or closed pipes do
+not remove the deadline. The SSH client allows 60 additional seconds for remote
+termination and status delivery. The harness directly holds the lock, which is
+released when it exits or is killed. Ordinary reaper contention during final
+cleanup is skipped without a failure alert or changes to the lock owner's files.
 
 The existing **`pareton-gpu-reap.timer` runs on the validator VPS every 10 minutes**
 and SSHes to the configured node. Enable it and deploy updated code on both hosts

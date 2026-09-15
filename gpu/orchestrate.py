@@ -49,7 +49,13 @@ from gpu.registry import (
     parse_pod_name,
 )
 from gpu.ssh import REPO_RSYNC_EXCLUDES, SshRunner, exec as ssh_exec, pull, push
-from gpu.static_host import HOST_BUSY_EXIT, REMOTE_LOCK, HostBusyError, host_lock
+from gpu.static_host import (
+    HOST_BUSY_EXIT,
+    REMOTE_LOCK,
+    HostBusyError,
+    bounded_bench_command,
+    host_lock,
+)
 from gpu.types import Pod, PodSpec, SshTarget
 from observability import events as obs
 from round.rank import ENTRY_STATUSES
@@ -283,7 +289,15 @@ def _static_host_cleanup(
         timeout_s=600.0,
         runner=runner,
         state_dir=state_dir,
+        check=False,
     )
+    if result.exit_code == HOST_BUSY_EXIT:
+        raise NoCapacityError("static GPU host is busy with maintenance or another run")
+    if result.exit_code:
+        raise GpuError(
+            f"static host cleanup failed (exit {result.exit_code}): "
+            f"{(result.stderr or result.stdout).strip()[-800:]}"
+        )
     if result.stderr.strip():
         logger.info("static host cleanup: %s", result.stderr.strip())
 
@@ -936,21 +950,20 @@ def run_bench_on_pod(
                 f"cd {REMOTE_REPO} && set -a && . {REMOTE_ENV} && set +a && "
                 f"export PARETON_BENCH_CODE_SHA={code_sha} && "
                 f"mkdir -p {shlex.quote(remote_out)} && "
-                f"{REMOTE_VENV}/bin/python -m bench "
+                f"exec {REMOTE_VENV}/bin/python -m bench "
                 f"--request {REMOTE_REQUEST} --output-dir {shlex.quote(remote_out)}{mock_flag}"
             )
+            ssh_timeout = float(
+                config.BENCH_TIMEOUT_S if bench_timeout_s is None else bench_timeout_s
+            )
             if pod.provider == "static_ssh":
-                limit = float(
-                    config.BENCH_TIMEOUT_S
-                    if bench_timeout_s is None
-                    else bench_timeout_s
-                )
                 # Bound the remote process too: a dead SSH client must not leave
                 # a harness running indefinitely on a paid static machine.
-                bench_cmd = (
-                    f"timeout --signal=TERM --kill-after=30s {limit:g}s "
-                    f"flock -w 120 -E {HOST_BUSY_EXIT} {REMOTE_LOCK} sh -c {shlex.quote(bench_cmd)}"
+                bench_cmd = bounded_bench_command(
+                    bench_cmd, output_dir=remote_out, timeout_s=ssh_timeout
                 )
+                # Let remote TERM, its 30s KILL grace, and SSH status delivery finish.
+                ssh_timeout += 60.0
             # ssh exec does not stream; poll the harness marker while it blocks.
             poller = _PodPhasePoller(
                 pod,
@@ -964,11 +977,7 @@ def run_bench_on_pod(
                 result = ssh_exec(
                     pod,
                     bench_cmd,
-                    timeout_s=float(
-                        config.BENCH_TIMEOUT_S
-                        if bench_timeout_s is None
-                        else bench_timeout_s
-                    ),
+                    timeout_s=ssh_timeout,
                     runner=runner,
                     state_dir=registry.state_dir,
                     check=False,
@@ -1005,6 +1014,9 @@ def run_bench_on_pod(
         if pod.provider == "static_ssh" and outputs_pulled:
             collected_output = f"static-{pod.name}"
     except BaseException as exc:
+        if isinstance(exc, NoCapacityError) and pod and pod.provider == "static_ssh":
+            # Includes a reaper that acquired the lock during bootstrap.
+            static_claimed = False
         pending = exc
     finally:
         # Release the local host lock even if teardown itself raises.
@@ -1020,13 +1032,20 @@ def run_bench_on_pod(
                             runner=runner,
                             state_dir=registry.state_dir,
                         )
+                    except NoCapacityError:
+                        static_claimed = False
+                        logger.info(
+                            "static host busy; leaving cleanup to the lock owner"
+                        )
                     except GpuError as exc:
                         logger.error(
                             "static host cleanup failed; retry before next round: %s",
                             exc,
                         )
                         obs.static_host_cleanup_failed(pod=pod.name, error=str(exc))
-                if keep:
+                if pod.provider == "static_ssh" and not static_claimed:
+                    pass
+                elif keep:
                     print(f"keep pod={pod.name}", flush=True)
                 else:
                     phase(BenchPhase.TEARDOWN.value)

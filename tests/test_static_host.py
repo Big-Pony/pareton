@@ -127,6 +127,20 @@ def test_host_lock_refuses_overlap_and_releases_after_failure(tmp_path):
         pass
 
 
+def test_cleanup_cli_reports_busy_without_touching_resources(tmp_path, monkeypatch):
+    from gpu import static_host
+
+    lock = tmp_path / "host.lock"
+    monkeypatch.setattr(static_host, "REMOTE_LOCK", str(lock))
+    calls = []
+    monkeypatch.setattr(static_host, "cleanup", lambda **kw: calls.append(kw))
+    with host_lock(lock):
+        assert static_host.main([]) == static_host.HOST_BUSY_EXIT
+    assert not calls
+    assert static_host.main([]) == 0
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize(
     "names,expected,count,ok",
     [

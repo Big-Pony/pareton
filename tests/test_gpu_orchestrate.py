@@ -1932,7 +1932,7 @@ def test_failed_login_raises_rather_than_warning(tmp_path: Path):
 
 
 @pytest.mark.parametrize("exit_code", [0, 3])
-@pytest.mark.parametrize("cleanup_fails", [False, True])
+@pytest.mark.parametrize("cleanup_fails", [False, True, "busy"])
 @pytest.mark.parametrize("transport_failure", [None, "pull", "ssh", "busy"])
 def test_static_host_round_cleans_before_pulls_and_after_bench(
     tmp_path, monkeypatch, exit_code, cleanup_fails, transport_failure
@@ -1966,6 +1966,8 @@ def test_static_host_round_cleans_before_pulls_and_after_bench(
         cleanups.append(kwargs)
         stages.append("cleanup")
         if cleanup_fails and len(cleanups) == 2:
+            if cleanup_fails == "busy":
+                raise NoCapacityError("reaper holds host lock")
             raise GpuError("candidate image still in use")
 
     monkeypatch.setattr("gpu.orchestrate._static_host_cleanup", cleanup)
@@ -1974,6 +1976,7 @@ def test_static_host_round_cleans_before_pulls_and_after_bench(
         text = " ".join(cmd)
         commands.append(text)
         if "python -m bench" in text:
+            assert kwargs["timeout"] == 183
             stages.append("bench")
             if transport_failure == "ssh":
                 raise GpuError("SSH connection lost")
@@ -2013,13 +2016,23 @@ def test_static_host_round_cleans_before_pulls_and_after_bench(
         assert bool(cleanups[1]["collected_output"]) == (transport_failure is None)
     else:
         assert len(cleanups) == 1 and not provider.destroy_calls
-    assert len(alerts) == int(cleanup_fails and transport_failure != "busy")
+    assert len(alerts) == int(cleanup_fails is True and transport_failure != "busy")
+    if cleanup_fails == "busy":
+        assert not provider.destroy_calls
     assert stages == expected_stages
     assert cleanups[0]["candidates"]
     assert cleanups[0].get("collected_output") is None
     command = next(c for c in commands if "python -m bench" in c)
     assert "timeout --signal=TERM --kill-after=30s 123s" in command
-    assert f"flock -w 120 -E {HOST_BUSY_EXIT} /opt/pareton/.static-host.lock" in command
+    assert (
+        f"flock --no-fork -w 120 -E {HOST_BUSY_EXIT} /opt/pareton/.static-host.lock"
+        in command
+    )
+    assert "exec nohup setsid --wait timeout" in command
+    assert "supervisor.log" in command and "2>&1 < /dev/null" in command
+    from gpu.bootstrap import REMOTE_VENV
+
+    assert f"exec {REMOTE_VENV}/bin/python -m bench" in command
     assert "/out/static-pt-" in command
 
 
@@ -2057,3 +2070,46 @@ def test_busy_static_host_is_not_bootstrapped_or_cleaned(
         )
     assert not touched
     assert isinstance(exc.value, NoCapacityError) == (conflict in ("local", "remote"))
+
+
+@pytest.mark.parametrize("cleanup_exit", [HOST_BUSY_EXIT, 1, 255])
+def test_reaper_racing_bootstrap_defers_only_lock_contention(
+    tmp_path, monkeypatch, cleanup_exit
+):
+    provider = FakeProvider()
+    provider.name = "static_ssh"
+    stages = []
+    monkeypatch.setattr(
+        "gpu.orchestrate.bootstrap_pod",
+        lambda *a, **k: stages.append("bootstrap") or "sha",
+    )
+    monkeypatch.setattr("gpu.orchestrate._write_remote_env", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "gpu.orchestrate._delete_remote_env",
+        lambda *a, **k: stages.append("delete-env"),
+    )
+    monkeypatch.setattr(
+        "gpu.orchestrate.pull_engine_images",
+        lambda *a, **k: pytest.fail("must not pull"),
+    )
+
+    def runner(cmd, **kwargs):
+        if "python3 -m gpu.static_host" in cmd[-1]:
+            assert stages == ["bootstrap"]
+            stages.append("cleanup")
+            return SshResult(cleanup_exit, "", "cleanup busy or failed")
+        return SshResult(0, "", "")  # The initial lock probe succeeds.
+
+    with pytest.raises(GpuError) as exc:
+        run_bench_on_pod(
+            PodSpec(provider="static_ssh"),
+            request_path=SAMPLE_REQUEST,
+            output_dir=tmp_path / "out",
+            state_dir=tmp_path / "state",
+            provider=provider,
+            runner=runner,
+        )
+    assert isinstance(exc.value, NoCapacityError) == (cleanup_exit == HOST_BUSY_EXIT)
+    if cleanup_exit == HOST_BUSY_EXIT:
+        assert stages == ["bootstrap", "cleanup"]
+        assert not provider.destroy_calls
