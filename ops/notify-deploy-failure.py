@@ -96,7 +96,15 @@ def http_post_json(url: str, payload: dict, timeout: int) -> tuple[bool, str | N
     """POST the webhook; return (ok, message_id-or-error-category)."""
     body = json.dumps(payload).encode()
     request = urllib.request.Request(
-        f"{url}?wait=true", data=body, headers={"Content-Type": "application/json"}
+        f"{url}?wait=true",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": (
+                "DiscordBot (https://github.com/Pareton-ai/pareton, 1.0) "
+                "pareton-deploy-notifier/1.0"
+            ),
+        },
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
