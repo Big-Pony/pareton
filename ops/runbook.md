@@ -99,6 +99,7 @@ as "not verified here", not as a fault; re-run as root on the box.
 1. Add a `/run`-only test drop-in that fails before any real work:
 
    ```sh
+   install -d /run/systemd/system/pareton-deploy.service.d
    printf '[Service]\nExecStartPre=/bin/false\n' \
      > /run/systemd/system/pareton-deploy.service.d/test-failure.conf
    systemctl daemon-reload
@@ -135,6 +136,23 @@ as "not verified here", not as a fault; re-run as root on the box.
    service record + Discord message ID + receiver confirmation, timer state.
 4. Afterward, verify new events arrive in `pareton-prod` (weights events and
    deploy logs are the natural probes). Do not force a chain weights submit.
+
+### Applying the September 15 stage-1 fixes
+
+Keep the deploy timer stopped until the fixes are merged and installed. Follow
+the bootstrap installation order (helpers and deploy script first, then
+`sync-config.py apply`) from the merged checkout. Vector's unit and candidate
+validation both need `--dangerously-allow-env-var-interpolation` for 0.57+;
+otherwise the environment token reference is sent literally. Do not restore an
+inline token to Git. Confirm fresh events reach Axiom after applying the fix;
+`vector validate` and `systemctl is-active` do not prove delivery.
+
+The corrected scanner now detects unknown `/etc` and `/run` drop-ins for every
+managed service and timer, including the controlled-failure override in section
+3. Resolve reported overrides before resuming; do not bypass the check. Repeat
+the failure notification acceptance and normal tick before closing the window.
+A stopped but enabled timer can return after reboot, so coordinate any host
+restart during the pause with the rollout owner.
 
 ## 5. Hotfix procedure once auto-sync is live
 
