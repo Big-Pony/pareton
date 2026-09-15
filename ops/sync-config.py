@@ -397,7 +397,7 @@ def scan_unexpected(entries: list[Entry]) -> list[dict]:
         name = Path(entry.target).name
         if parent.endswith(".d"):
             managed_units.add(parent[:-2])
-        elif name.endswith((".service", ".timer")) and parent == "systemd":
+        elif name.endswith((".service", ".timer")) and parent == "system":
             managed_units.add(name)
     etc = p("/etc/systemd/system")
     try:
@@ -559,7 +559,12 @@ def validate_candidates(
                 # Spec 4.4: never guess or fake credentials; fail before install.
                 raise Fail(3, "axiom-token-unavailable", problems=problems or ["empty"])
             result = run_cmd(
-                ["vector", "validate", str(stage / "vector.toml")],
+                [
+                    "vector",
+                    "validate",
+                    "--dangerously-allow-env-var-interpolation",
+                    str(stage / "vector.toml"),
+                ],
                 env={"PARETON_AXIOM_TOKEN": token},
             )
             if result.returncode != 0:

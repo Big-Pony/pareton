@@ -40,6 +40,20 @@ docker exec pareton-verify bash /root/acceptance.sh
 
 ## Documented deviations from production
 
+Before substituting the file sink, `acceptance.sh` runs `vector-auth.py` against
+the repository's actual Vector startup arguments and token expression. A local
+HTTP receiver checks the expanded synthetic token; the real config validator
+must also expand its test data directory. This catches the Vector 0.57 default
+that otherwise sends `${PARETON_AXIOM_TOKEN}` literally while reporting a healthy
+sink. No production credentials or external network are needed. Run it alone
+from the repository root after building the image above:
+
+```sh
+docker run --rm --network none --entrypoint python3 \
+  -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/repo:ro" -w /repo \
+  pareton-systemd-verify /repo/ops/isolated-acceptance/vector-auth.py
+```
+
 - The Axiom sink is replaced by a file sink (no real token in isolation);
   token-presence gating still runs against a fake value.
 - The webhook points at `.invalid`, so the send path fails by design — this

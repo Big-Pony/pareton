@@ -206,11 +206,20 @@ def test_perms_drift_reported_and_fixed(env):
 # ---------------------------------------------------------------- blocking
 
 
-def test_unmanaged_drop_in_blocks_and_protects_other_targets(env):
+@pytest.mark.parametrize(
+    "unit",
+    [
+        "pareton-worker.service",
+        "pareton-deploy.service",
+        "vector.service",
+        "pareton-deploy.timer",
+    ],
+)
+def test_unmanaged_drop_in_blocks_and_protects_other_targets(env, unit):
     install_clean_state(env)
     api = env.target("/etc/systemd/system/pareton-api.service")
     api.write_text("garbage")
-    write_unit(env, "pareton-worker.service.d/unknown.conf", "[Service]\nNice=1\n")
+    write_unit(env, f"{unit}.d/unknown.conf", "[Service]\nNice=1\n")
     code, payload = run_mode(env, "deploy-hook")
     assert code == 3
     assert payload["error"] == "blocked"
@@ -228,14 +237,27 @@ def test_masked_unit_blocks(env):
     assert any(f["category"] == "masked" for f in payload["findings"])
 
 
-def test_runtime_override_blocks(env):
+@pytest.mark.parametrize(
+    "unit",
+    [
+        "pareton-worker.service",
+        "pareton-deploy.service",
+        "vector.service",
+        "pareton-deploy.timer",
+    ],
+)
+def test_runtime_override_blocks(env, unit):
     install_clean_state(env)
-    override = env.target("/run/systemd/system/pareton-worker.service.d/x.conf")
+    override = env.target(f"/run/systemd/system/{unit}.d/test-failure.conf")
     override.parent.mkdir(parents=True)
-    override.write_text("[Service]\n")
+    override.write_text("[Service]\nExecStartPre=/bin/false\n")
     code, payload = run_mode(env, "check")
     assert code == 3
     assert any(f["category"] == "override" for f in payload["findings"])
+    env.log.write_text("")
+    code, _ = run_mode(env, "deploy-hook")
+    assert code == 3
+    assert env.calls() == []  # No install/reload/restart while the override exists.
 
 
 def test_missing_onfailure_converges_like_any_drift(env):
