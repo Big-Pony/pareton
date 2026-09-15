@@ -92,6 +92,8 @@ DEGENERACY_MAX_REPEATED_SPAN_RATIO = 0.25
 # A larger exclusion set no longer provides a representative correctness
 # sample. This is a harness invariant rather than campaign policy.
 MAX_BASELINE_PROMPT_DROPS = 4
+# Reasoning models close their thinking with this tag before the final answer.
+REASONING_END = "</think>"
 
 
 @dataclass(frozen=True)
@@ -484,7 +486,53 @@ def degeneracy_reason(
     The thresholds are harness invariants rather than campaign policy. A miner
     cannot opt out through a legacy manifest or tune a competition around the
     exact exploit boundary.
+
+    Thinking and the final answer are graded separately, split at the first
+    ``</think>``. A reasoning model often restates its last thought as a short
+    answer, and graded as one text that restatement reads as a repeated span.
+    Output that never closes its thinking is graded whole, so a loop inside
+    thinking is still caught. Only the first tag splits: later tags stay in the
+    answer, so scattered tags cannot cut a loop into pieces too short to grade.
+    Precomputed ratios describe the whole text, so they are ignored on a split.
     """
+    thinking, tag, answer = text.partition(REASONING_END)
+    if tag:
+        for label, part in (("thinking", thinking), ("answer", answer)):
+            reason = _text_degeneracy_reason(part)
+            if reason is not None:
+                return f"{label}: {reason}"
+        return None
+    return _text_degeneracy_reason(
+        text, distinct_ratio=distinct_ratio, repeated_span_ratio=repeated_span_ratio
+    )
+
+
+def graded_ratios(text: str) -> tuple[float, float]:
+    """(lowest distinct n-gram ratio, highest repeated-span ratio) as graded.
+
+    Uses the same split as ``degeneracy_reason``, so the relative bar compares
+    a candidate and its baseline part by part. Text without ``</think>`` is
+    measured whole, exactly as before. Parts shorter than
+    ``DEGENERACY_MIN_CHARS`` carry no signal and are skipped.
+    """
+    thinking, tag, answer = text.partition(REASONING_END)
+    if not tag:
+        return distinct_ngram_ratio(text), longest_repeated_substring_ratio(text)
+    parts = [part for part in (thinking, answer) if len(part) >= DEGENERACY_MIN_CHARS]
+    if not parts:
+        return 1.0, 0.0
+    return (
+        min(distinct_ngram_ratio(part) for part in parts),
+        max(longest_repeated_substring_ratio(part) for part in parts),
+    )
+
+
+def _text_degeneracy_reason(
+    text: str,
+    *,
+    distinct_ratio: float | None = None,
+    repeated_span_ratio: float | None = None,
+) -> str | None:
     if len(text) < DEGENERACY_MIN_CHARS:
         return None
     ratio = distinct_ratio if distinct_ratio is not None else distinct_ngram_ratio(text)
@@ -523,9 +571,9 @@ def relative_degeneracy_reason(
     """
     if len(text) < DEGENERACY_MIN_CHARS:
         return None
-    distinct = (
-        distinct_ratio if distinct_ratio is not None else distinct_ngram_ratio(text)
-    )
+    if distinct_ratio is None or repeated_span_ratio is None:
+        distinct_ratio, repeated_span_ratio = graded_ratios(text)
+    distinct = distinct_ratio
     if (
         distinct < DEGENERACY_MIN_DISTINCT_NGRAM_RATIO
         and distinct < baseline_distinct_ratio
@@ -534,11 +582,7 @@ def relative_degeneracy_reason(
             f"distinct {DEGENERACY_NGRAM}-gram ratio {distinct:.3f} below "
             f"baseline {baseline_distinct_ratio:.3f} over {len(text)} chars"
         )
-    repeated = (
-        repeated_span_ratio
-        if repeated_span_ratio is not None
-        else longest_repeated_substring_ratio(text)
-    )
+    repeated = repeated_span_ratio
     if (
         repeated >= DEGENERACY_MAX_REPEATED_SPAN_RATIO
         and repeated > baseline_repeated_span_ratio
@@ -716,14 +760,11 @@ def build_baseline_degeneracy_references(
         if sample_reason is not None:
             _record_baseline_prompt_drop(dropped, captured.request_id, sample_reason)
             continue
+        sample_ratios = [graded_ratios(text) for text in samples]
         references[captured.request_id] = BaselineDegeneracyReference(
             natural_stop_tokens=stop.completion_tokens,
-            full_distinct_ngram_ratio=min(
-                distinct_ngram_ratio(text) for text in samples
-            ),
-            full_repeated_span_ratio=max(
-                longest_repeated_substring_ratio(text) for text in samples
-            ),
+            full_distinct_ngram_ratio=min(ratio[0] for ratio in sample_ratios),
+            full_repeated_span_ratio=max(ratio[1] for ratio in sample_ratios),
         )
     return BaselineDegeneracyReferences(references, dropped=dropped)
 
@@ -1021,8 +1062,7 @@ def grade_candidate(
             scored = [position.logprob for position in positions]
             logprobs.extend(scored)
             span_positions += span
-            distinct_ratio = distinct_ngram_ratio(captured.output_text)
-            repeated_span_ratio = longest_repeated_substring_ratio(captured.output_text)
+            distinct_ratio, repeated_span_ratio = graded_ratios(captured.output_text)
             if reference is None:
                 prefix_text = captured.output_text
                 prefix_distinct_ratio = distinct_ratio
@@ -1035,8 +1075,7 @@ def grade_candidate(
                 relative_degenerate = None
             else:
                 prefix_text = scored_prefix
-                prefix_distinct_ratio = distinct_ngram_ratio(prefix_text)
-                prefix_repeated_span_ratio = longest_repeated_substring_ratio(
+                prefix_distinct_ratio, prefix_repeated_span_ratio = graded_ratios(
                     prefix_text
                 )
                 this_degenerate = degeneracy_reason(
