@@ -790,6 +790,40 @@ def test_a_restated_thought_passes_the_candidate_gate(tmp_path: Path):
     assert report.verdict == "pass"
 
 
+def test_a_restated_thought_passes_the_baseline_relative_bar(tmp_path: Path):
+    """References and the relative bar use the same split as the absolute bar.
+
+    Graded whole, a candidate restating one character differently from the
+    baseline sits a hair above the baseline's whole-text repeated span.
+    """
+    references = build_baseline_degeneracy_references(
+        [_captured("r1", "Hello world", RESTATED_THOUGHT)],
+        {
+            "r1": NaturalStopReference(
+                request_id="r1",
+                completion_tokens=len(mock_tokenize(RESTATED_THOUGHT)),
+                finish_reason="stop",
+                text=RESTATED_THOUGHT,
+                probed=False,
+            )
+        },
+    )
+    candidate = RESTATED_THOUGHT.replace("goto 212", "goto 21")
+    assert longest_repeated_substring_ratio(
+        candidate
+    ) > longest_repeated_substring_ratio(RESTATED_THOUGHT)
+    outputs = [_captured("r1", "Hello world", candidate, tokens=40)]
+    with MockEngine(MockEngineConfig(host="127.0.0.1", port=0)) as scorer:
+        report = grade_candidate(
+            scorer.base_url,
+            outputs,
+            cfg=_cfg(num_prompts=1),
+            evidence_path=tmp_path / "correctness" / "candidate_0.jsonl",
+            baseline_degeneracy=references,
+        )
+    assert report.verdict == "pass"
+
+
 def test_a_loop_inside_closed_thinking_is_still_caught():
     reason = degeneracy_reason(LOOP_TEXT + "\n</think>\n\n" + PROSE_TEXT)
     assert reason is not None and reason.startswith("thinking: ")
