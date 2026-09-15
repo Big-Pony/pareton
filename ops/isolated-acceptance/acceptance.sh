@@ -22,6 +22,9 @@ REPO=/opt/pareton
 OPS=/usr/local/lib/pareton-ops
 SHIPPED=/var/log/vector-shipped.log
 
+# Test authentication before the file-sink substitution below removes the token.
+python3 "$REPO/ops/isolated-acceptance/vector-auth.py" || exit 1
+
 echo "=== setup ==="
 # Both path forms: direct commands validate the worktree, the clone/upload-pack
 # transport validates the raw .git directory.
