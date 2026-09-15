@@ -16,6 +16,7 @@ from bench.correctness import (
     PromptCase,
     build_baseline_degeneracy_references,
     capture_outputs,
+    degeneracy_reason,
     distinct_ngram_ratio,
     extract_output_logprobs,
     grade_all,
@@ -760,6 +761,50 @@ def test_a_compact_loop_is_not_exempt_from_the_text_bars(tmp_path: Path):
             evidence_path=tmp_path / "correctness" / "candidate_0.jsonl",
         )
     assert report.verdict == "fail_correctness"
+
+
+# Observed on the 4x5090 Qwen3.8 sample round (hf-006): the model restates its
+# last thought as the answer, which reads as a repeated span when graded whole.
+RESTATED_THOUGHT = (
+    "Let me look at the rest of the command.py file to understand the full picture.\n"
+    "</think>\n\n"
+    "Let me look at the rest of the command.py file to understand the full picture.\n\n"
+    "```\ngoto 212\n```"
+)
+
+
+def test_a_thought_restated_as_the_answer_is_not_degenerate():
+    assert longest_repeated_substring_ratio(RESTATED_THOUGHT) >= 0.25
+    assert degeneracy_reason(RESTATED_THOUGHT) is None
+
+
+def test_a_restated_thought_passes_the_candidate_gate(tmp_path: Path):
+    outputs = [_captured("r1", "Hello world", RESTATED_THOUGHT, tokens=40)]
+    with MockEngine(MockEngineConfig(host="127.0.0.1", port=0)) as scorer:
+        report = grade_candidate(
+            scorer.base_url,
+            outputs,
+            cfg=_cfg(num_prompts=1),
+            evidence_path=tmp_path / "correctness" / "candidate_0.jsonl",
+        )
+    assert report.verdict == "pass"
+
+
+def test_a_loop_inside_closed_thinking_is_still_caught():
+    reason = degeneracy_reason(LOOP_TEXT + "\n</think>\n\n" + PROSE_TEXT)
+    assert reason is not None and reason.startswith("thinking: ")
+
+
+def test_a_loop_in_the_final_answer_is_still_caught():
+    reason = degeneracy_reason(PROSE_TEXT + "\n</think>\n\n" + LOOP_TEXT)
+    assert reason is not None and reason.startswith("answer: ")
+
+
+def test_scattered_think_tags_cannot_hide_a_loop():
+    """Every piece is under DEGENERACY_MIN_CHARS; only the first tag splits."""
+    text = "same words again </think>" * 40
+    reason = degeneracy_reason(text)
+    assert reason is not None and reason.startswith("answer: ")
 
 
 def test_degeneracy_evidence_records_the_metric(tmp_path: Path):

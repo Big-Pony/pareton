@@ -92,6 +92,8 @@ DEGENERACY_MAX_REPEATED_SPAN_RATIO = 0.25
 # A larger exclusion set no longer provides a representative correctness
 # sample. This is a harness invariant rather than campaign policy.
 MAX_BASELINE_PROMPT_DROPS = 4
+# Reasoning models close their thinking with this tag before the final answer.
+REASONING_END = "</think>"
 
 
 @dataclass(frozen=True)
@@ -484,7 +486,33 @@ def degeneracy_reason(
     The thresholds are harness invariants rather than campaign policy. A miner
     cannot opt out through a legacy manifest or tune a competition around the
     exact exploit boundary.
+
+    Thinking and the final answer are graded separately, split at the first
+    ``</think>``. A reasoning model often restates its last thought as a short
+    answer, and graded as one text that restatement reads as a repeated span.
+    Output that never closes its thinking is graded whole, so a loop inside
+    thinking is still caught. Only the first tag splits: later tags stay in the
+    answer, so scattered tags cannot cut a loop into pieces too short to grade.
+    Precomputed ratios describe the whole text, so they are ignored on a split.
     """
+    thinking, tag, answer = text.partition(REASONING_END)
+    if tag:
+        for label, part in (("thinking", thinking), ("answer", answer)):
+            reason = _text_degeneracy_reason(part)
+            if reason is not None:
+                return f"{label}: {reason}"
+        return None
+    return _text_degeneracy_reason(
+        text, distinct_ratio=distinct_ratio, repeated_span_ratio=repeated_span_ratio
+    )
+
+
+def _text_degeneracy_reason(
+    text: str,
+    *,
+    distinct_ratio: float | None = None,
+    repeated_span_ratio: float | None = None,
+) -> str | None:
     if len(text) < DEGENERACY_MIN_CHARS:
         return None
     ratio = distinct_ratio if distinct_ratio is not None else distinct_ngram_ratio(text)
