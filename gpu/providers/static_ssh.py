@@ -77,13 +77,13 @@ class StaticSshProvider:
                 hourly_price_cents=0,
                 gpu_count=spec.gpu_count or 1,
                 gpu_type=spec.gpu_type or "static",
-                raw={},
+                raw={"gpu_type": spec.gpu_type, "gpu_count": spec.gpu_count},
             )
         ]
 
-    def provision(self, offer: Offer, *, name: str, ssh_public_key: str) -> Pod:
-        del ssh_public_key  # unused; caller provides durable key for cloud only
-        pod = Pod(
+    def maintenance_pod(self, *, name: str = "static-host") -> Pod:
+        """Describe the unmanaged target without provisioning or needing healthy GPUs."""
+        return Pod(
             provider=self.name,
             pod_id=f"{self._target.user}@{self._target.host}:{self._target.port}",
             name=name,
@@ -94,8 +94,31 @@ class StaticSshProvider:
             ttl_hours=0.0,
             raw={"unmanaged": True},
         )
-        # Connectivity check.
-        ssh_exec(pod, "true", timeout_s=60.0)
+
+    def provision(self, offer: Offer, *, name: str, ssh_public_key: str) -> Pod:
+        del ssh_public_key  # unused; caller provides durable key for cloud only
+        pod = self.maintenance_pod(name=name)
+        # Validate the actual host; a static target is global across campaigns.
+        result = ssh_exec(
+            pod, "nvidia-smi --query-gpu=name --format=csv,noheader", timeout_s=60.0
+        )
+        names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        count = int(offer.raw.get("gpu_count", offer.gpu_count))
+        expected = str(offer.raw.get("gpu_type", offer.gpu_type) or "")
+        if len(names) < count or (
+            expected and any(_gpu_name(name) != _gpu_name(expected) for name in names)
+        ):
+            raise ProvisionError(
+                f"static_ssh hardware mismatch: requested {count}x {expected or 'GPU'}, "
+                f"found {names}; use a matching host or drain incompatible campaigns"
+            )
+        if len(names) > count:
+            logger.warning(
+                "static_ssh host has %d GPUs; this campaign uses %d (%d idle)",
+                len(names),
+                count,
+                len(names) - count,
+            )
         return pod
 
     def destroy(self, pod: Pod) -> None:
@@ -106,3 +129,8 @@ class StaticSshProvider:
 
     def list_volumes(self) -> list[dict[str, Any]]:
         return []
+
+
+def _gpu_name(value: str) -> str:
+    value = re.sub(r"\b(nvidia|geforce)\b", "", value.lower())
+    return re.sub(r"[^a-z0-9]", "", value)

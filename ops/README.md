@@ -206,3 +206,110 @@ systemctl start pareton-builder-cleanup.service
 systemctl start pareton-deploy.timer
 journalctl -u pareton-builder-cleanup.service -n 100 --no-pager
 ```
+
+## Use a fixed GPU machine
+
+Configure the existing provider mode in the validator's `.env`:
+
+```dotenv
+PARETON_GPU_PROVIDERS=static_ssh
+PARETON_GPU_STATIC_SSH=user@host:port
+PARETON_GPU_SSH_KEY_PATH=/path/to/key
+```
+
+Restart `pareton-round-worker` after its current round finishes. Use a dedicated
+Linux node with NVIDIA drivers, SSH access and passwordless sudo when the SSH
+user is not root. One validator should own this node. Worker processes on that
+validator must share `PARETON_GPU_STATE_DIR` so they use the same host lock.
+The bootstrap still recreates the remote Python environment each round.
+
+### Campaigns and rental ownership
+
+This setting routes every campaign to the same host. Before switching to a 5090
+node, close the H200 campaign and finish its pending/running rounds on compatible
+hardware. **Closing a campaign alone does not drain its existing queue.** Static
+provisioning probes `nvidia-smi` and rejects mismatched models, mixed GPU models,
+or insufficient GPU counts before evaluation. A larger matching node is allowed,
+but the worker logs its unused GPU count. Rent a 4-GPU node for a campaign pinned
+to 4 GPUs; changing the campaign's GPU count changes its benchmark configuration.
+
+Static mode never cancels the Lium rental, including at campaign closure. Release
+the machine manually when it is no longer needed. Use an operator-managed name
+for both the rental and its volume. **Do not repurpose a `pt-<timestamp>-<ttl>h-*`
+rental without retiring its TTL management first:** the reaper still scans cloud
+providers for those names, even when `GPU_PROVIDERS=static_ssh`. Static SSH entries
+are skipped, but that does not exempt a separately listed cloud rental.
+
+### Automatic housekeeping
+
+Before pulling images, each static run removes abandoned `pareton-bench-<run-id>`
+containers and networks. Container removal includes anonymous volumes. It also
+removes obsolete candidate images recorded by previous runs. After collecting
+the result, it removes the current candidate images and its temporary remote
+output directory. The candidate image tracking file is
+`/opt/pareton/.static-host-images.json`; keep it across worker restarts. Failed
+image deletions remain tracked for retry and produce a cleanup failure.
+
+Cleanup is limited to Pareton bench names and recorded image references. Baseline
+images for the current requests, `/workspace/hf-cache`, and
+`/workspace/engine-cache` are preserved. Candidate containers do not mount the
+shared compile cache; normal container teardown also removes anonymous volumes.
+Inspect images left from runs predating this tracking file separately before
+removing them. Automatic reclamation runs with every round, so candidate images
+from ongoing work do not need a separate daily pruning job.
+
+A local host lock prevents overlapping workers; a remote lock protects the
+harness from housekeeping. Bootstrap refuses a host whose previous harness is
+still active. The remote harness has the same time limit as its SSH invocation,
+with a 30-second forced-kill grace period. After a worker crash or timeout, the
+next run or periodic reaper reclaims abandoned containers once the prior harness
+has exited. A new harness waits up to 120 seconds for brief maintenance to finish.
+
+The existing `pareton-gpu-reap.timer` also checks a configured static host every
+10 minutes, independently of the round worker. It takes the remote host lock,
+skips active harnesses, removes idle Pareton containers/networks, and checks
+`nvidia-smi --query-compute-apps=pid` for remaining GPU compute processes. It
+allows two seconds for process exit before reporting a failure. This periodic
+path leaves image tracking and output files untouched, so it cannot delete a
+report that the worker is still downloading or depend on a valid image ledger.
+Remaining processes, an unreachable host or failed GPU inspection emit
+`static_host_cleanup_failed` and fail the reaper run for monitoring.
+
+Deploy the updated code on the validator and GPU node (normal bootstrap uploads
+it), and ensure `pareton-gpu-reap.timer` is enabled on the validator. Its service
+reads the static SSH target/key from the same `.env`. This handles worker failure
+while the validator and SSH remain reachable. If the whole validator is down,
+its timer cannot run. A live harness keeps its lock until exit or its configured
+timeout; periodic cleanup deliberately leaves it running.
+
+Container process termination normally frees its GPU allocations. The check
+confirms that compute processes are gone; it does not require zero reported VRAM,
+reset the GPU driver, or kill unrelated processes. Driver failures or memory held
+outside managed containers require operator investigation. Validate crash
+recovery on the actual node before relying on this unattended.
+
+### Failed-round and cleanup alerts
+
+There is no cloud fallback when the configured provider is only `static_ssh`.
+An unreachable or incompatible host voids the round and emits `round_voided`.
+Cleanup failure after an otherwise successful round emits
+`static_host_cleanup_failed`, so a valid score is retained while disk cleanup
+still receives attention.
+
+Create an Axiom monitor using this query, the existing operations notifier,
+**Above 0 over 5 minutes**, and evaluation every minute. This is an event-count
+alert; keep **Alert on no data** off and retain the separate worker heartbeat
+alerts above.
+
+```apl
+['pareton-prod']
+| where (event == "round_voided" and void_reason in
+    ("pod_provision_failed", "pod_failed", "round_timeout", "heartbeat_stale"))
+    or event == "static_host_cleanup_failed"
+| summarize count()
+```
+
+Investigate the failed round's detail and `pareton-round-worker` journal, restore
+SSH/GPU access or resolve cleanup errors, then resume work on compatible hardware.
+The query and event emission are versioned here; the monitor and its notifier
+must be activated in Axiom during deployment.

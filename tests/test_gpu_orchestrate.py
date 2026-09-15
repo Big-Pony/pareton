@@ -1927,3 +1927,90 @@ def test_failed_login_raises_rather_than_warning(tmp_path: Path):
             ),
             state_dir=tmp_path / "st",
         )
+
+
+@pytest.mark.parametrize("exit_code", [0, 3])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_static_host_round_cleans_before_pulls_and_after_bench(
+    tmp_path, monkeypatch, exit_code, cleanup_fails
+):
+    provider = FakeProvider()
+    provider.name = "static_ssh"
+    stages = []
+    commands = []
+    cleanups = []
+    alerts = []
+    monkeypatch.setattr(
+        "gpu.orchestrate.obs.static_host_cleanup_failed", lambda **k: alerts.append(k)
+    )
+    monkeypatch.setattr("gpu.orchestrate.bootstrap_pod", lambda *a, **k: "sha")
+    monkeypatch.setattr("gpu.orchestrate.push", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "gpu.orchestrate.pull", lambda *a, **k: stages.append("pull-output")
+    )
+    monkeypatch.setattr("gpu.orchestrate._write_remote_env", lambda *a, **k: None)
+    monkeypatch.setattr("gpu.orchestrate._delete_remote_env", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "gpu.orchestrate.pull_engine_images",
+        lambda *a, **k: stages.append("pull-images"),
+    )
+
+    def cleanup(*a, **kwargs):
+        cleanups.append(kwargs)
+        stages.append("cleanup")
+        if cleanup_fails and len(cleanups) == 2:
+            raise GpuError("candidate image still in use")
+
+    monkeypatch.setattr("gpu.orchestrate._static_host_cleanup", cleanup)
+
+    def runner(cmd, **kwargs):
+        text = " ".join(cmd)
+        commands.append(text)
+        if "python -m bench" in text:
+            stages.append("bench")
+            return SshResult(exit_code, "", "")
+        return SshResult(0, "", "")
+
+    result = run_bench_on_pod(
+        PodSpec(provider="static_ssh"),
+        request_path=SAMPLE_REQUEST,
+        output_dir=tmp_path / "out",
+        state_dir=tmp_path / "state",
+        provider=provider,
+        runner=runner,
+        bench_timeout_s=123,
+    )
+    assert result == exit_code
+    assert len(alerts) == int(cleanup_fails)
+    assert stages == ["cleanup", "pull-images", "bench", "pull-output", "cleanup"]
+    assert cleanups[0]["candidates"]
+    assert not cleanups[1]["candidates"]
+    assert cleanups[0]["candidates"].isdisjoint(cleanups[1]["keep"])
+    command = next(c for c in commands if "python -m bench" in c)
+    assert "timeout --signal=TERM --kill-after=30s 123s" in command
+    assert "flock -w 120 /opt/pareton/.static-host.lock" in command
+    assert "/out/static-pt-" in command
+
+
+def test_busy_static_host_is_not_bootstrapped_or_cleaned(tmp_path, monkeypatch):
+    provider = FakeProvider()
+    provider.name = "static_ssh"
+    touched = []
+    for name in ("bootstrap_pod", "_delete_remote_env", "_static_host_cleanup"):
+        monkeypatch.setattr(
+            f"gpu.orchestrate.{name}", lambda *a, **k: touched.append(True)
+        )
+
+    def runner(cmd, **kwargs):
+        return SshResult(1, "", "host lock held")
+
+    with pytest.raises(GpuError, match="host lock held"):
+        run_bench_on_pod(
+            PodSpec(provider="static_ssh"),
+            request_path=SAMPLE_REQUEST,
+            output_dir=tmp_path / "out",
+            state_dir=tmp_path / "state",
+            provider=provider,
+            runner=runner,
+        )
+    assert not touched

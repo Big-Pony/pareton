@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import shlex
 import tempfile
 import threading
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -47,6 +49,7 @@ from gpu.registry import (
     parse_pod_name,
 )
 from gpu.ssh import REPO_RSYNC_EXCLUDES, SshRunner, exec as ssh_exec, pull, push
+from gpu.static_host import REMOTE_LOCK, host_lock
 from gpu.types import Pod, PodSpec, SshTarget
 from observability import events as obs
 from round.rank import ENTRY_STATUSES
@@ -256,6 +259,22 @@ def _engine_image_refs(req) -> list[str]:
         if img and img not in refs:
             refs.append(img)
     return refs
+
+
+def _static_host_cleanup(
+    pod: Pod, *, candidates: set[str], keep: set[str], runner, state_dir: Path
+) -> None:
+    result = ssh_exec(
+        pod,
+        f"cd {REMOTE_REPO} && python3 -m gpu.static_host "
+        f"--candidates {shlex.quote(json.dumps(sorted(candidates)))} "
+        f"--keep {shlex.quote(json.dumps(sorted(keep)))}",
+        timeout_s=600.0,
+        runner=runner,
+        state_dir=state_dir,
+    )
+    if result.stderr.strip():
+        logger.info("static host cleanup: %s", result.stderr.strip())
 
 
 def provision_pod(
@@ -790,150 +809,228 @@ def run_bench_on_pod(
     destroy_failed = False
     pending: BaseException | None = None
 
-    try:
-        if pod_name:
-            entry = registry.get(pod_name)
-            if entry is None:
-                raise ProvisionError(f"unknown pod {pod_name!r} in registry")
-            pod = _pod_from_entry(entry)
-            logger.info("reusing pod %s", pod.name)
-        else:
-            # provider=None: provision_pod walks the configured fallback order
-            # and destroy_pod later resolves the real provider from pod.provider.
-            phase(BenchPhase.PROVISIONING.value)
-            pod = provision_pod(
-                spec,
-                registry=registry,
-                provider=provider,
-                state_dir=registry.state_dir,
-            )
-        phase(BenchPhase.BOOTSTRAPPING.value)
-        code_sha = bootstrap_pod(
-            pod,
-            repo_root=repo_root,
-            runner=runner,
-            state_dir=registry.state_dir,
-        )
-        _write_remote_env(pod, runner=runner, state_dir=registry.state_dir)
-
-        if not mock_engine:
-            refs: list[str] = []
-            for _req_p, _local_out, req, _trace in preflighted:
-                for ref in _engine_image_refs(req):
-                    if ref not in refs:
-                        refs.append(ref)
-            phase(BenchPhase.PULLING_IMAGE.value)
-            pull_engine_images(
-                pod,
-                refs,
-                env_file=REMOTE_ENV,
-                runner=runner,
-                state_dir=registry.state_dir,
-            )
-
-        mock_flag = " --mock-engine" if mock_engine else ""
-        for req_p, local_out, _req, trace_path in preflighted:
-            local_out.mkdir(parents=True, exist_ok=True)
-            if pool or repetitions > 1:
-                run_name = local_out.name
-                remote_out = f"{REMOTE_OUT}/{run_name}"
+    static_prepared = False
+    static_claimed = False
+    with ExitStack() as resources:
+        try:
+            if pod_name:
+                entry = registry.get(pod_name)
+                if entry is None:
+                    raise ProvisionError(f"unknown pod {pod_name!r} in registry")
+                pod = _pod_from_entry(entry)
+                logger.info("reusing pod %s", pod.name)
             else:
-                remote_out = REMOTE_OUT
-
-            _push_remote_request(
+                # provider=None: provision_pod walks the configured fallback order
+                # and destroy_pod later resolves the real provider from pod.provider.
+                phase(BenchPhase.PROVISIONING.value)
+                pod = provision_pod(
+                    spec,
+                    registry=registry,
+                    provider=provider,
+                    state_dir=registry.state_dir,
+                )
+            if pod.provider == "static_ssh":
+                target = f"{pod.ssh.host}:{pod.ssh.port}"
+                token = hashlib.sha256(target.encode()).hexdigest()
+                try:
+                    resources.enter_context(
+                        host_lock(registry.state_dir / f"static-{token}.lock")
+                    )
+                except RuntimeError as exc:
+                    raise GpuError(str(exc)) from exc
+                # A harness surviving its SSH client must finish before bootstrap
+                # rewrites its Python environment or cleanup touches its containers.
+                ssh_exec(
+                    pod,
+                    f"if test -e {REMOTE_LOCK}; then flock -w 120 {REMOTE_LOCK} true || "
+                    "{ echo 'static GPU host is busy or its lock is unavailable' >&2; "
+                    "exit 1; }; fi",
+                    timeout_s=150.0,
+                    runner=runner,
+                    state_dir=registry.state_dir,
+                )
+                static_claimed = True
+            phase(BenchPhase.BOOTSTRAPPING.value)
+            code_sha = bootstrap_pod(
                 pod,
-                request_path=req_p,
-                trace_path=trace_path,
-                local_out=local_out,
                 repo_root=repo_root,
                 runner=runner,
                 state_dir=registry.state_dir,
             )
+            _write_remote_env(pod, runner=runner, state_dir=registry.state_dir)
 
-            bench_cmd = (
-                f"cd {REMOTE_REPO} && set -a && . {REMOTE_ENV} && set +a && "
-                f"export PARETON_BENCH_CODE_SHA={code_sha} && "
-                f"mkdir -p {remote_out} && "
-                f"{REMOTE_VENV}/bin/python -m bench "
-                f"--request {REMOTE_REQUEST} --output-dir {remote_out}{mock_flag}"
-            )
-            # ssh exec does not stream; poll the harness marker while it blocks.
-            poller = _PodPhasePoller(
-                pod,
-                remote_out=remote_out,
-                on_phase=phase,
-                runner=runner,
-                state_dir=registry.state_dir,
-                on_entry_status=on_entry_status,
-            )
-            with poller:
-                result = ssh_exec(
+            baselines = {
+                str(req.engines.baseline.image) for _, _, req, _ in preflighted
+            }
+            all_refs = {
+                ref for _, _, req, _ in preflighted for ref in _engine_image_refs(req)
+            }
+            if pod.provider == "static_ssh":
+                _static_host_cleanup(
                     pod,
-                    bench_cmd,
-                    timeout_s=float(
+                    candidates=all_refs - baselines,
+                    keep=all_refs,
+                    runner=runner,
+                    state_dir=registry.state_dir,
+                )
+                static_prepared = True
+
+            if not mock_engine:
+                refs: list[str] = []
+                for _req_p, _local_out, req, _trace in preflighted:
+                    for ref in _engine_image_refs(req):
+                        if ref not in refs:
+                            refs.append(ref)
+                phase(BenchPhase.PULLING_IMAGE.value)
+                pull_engine_images(
+                    pod,
+                    refs,
+                    env_file=REMOTE_ENV,
+                    runner=runner,
+                    state_dir=registry.state_dir,
+                )
+
+            mock_flag = " --mock-engine" if mock_engine else ""
+            for job_index, (req_p, local_out, _req, trace_path) in enumerate(
+                preflighted, start=1
+            ):
+                local_out.mkdir(parents=True, exist_ok=True)
+                if pool or repetitions > 1:
+                    run_name = local_out.name
+                    remote_out = f"{REMOTE_OUT}/{run_name}"
+                else:
+                    remote_out = REMOTE_OUT
+
+                if pod.provider == "static_ssh":
+                    # A unique path prevents the phase poller from reading an old
+                    # round's beacons or report while this round starts.
+                    remote_out = f"{REMOTE_OUT}/static-{pod.name}/run-{job_index:03d}"
+
+                _push_remote_request(
+                    pod,
+                    request_path=req_p,
+                    trace_path=trace_path,
+                    local_out=local_out,
+                    repo_root=repo_root,
+                    runner=runner,
+                    state_dir=registry.state_dir,
+                )
+
+                bench_cmd = (
+                    f"cd {REMOTE_REPO} && set -a && . {REMOTE_ENV} && set +a && "
+                    f"export PARETON_BENCH_CODE_SHA={code_sha} && "
+                    f"mkdir -p {shlex.quote(remote_out)} && "
+                    f"{REMOTE_VENV}/bin/python -m bench "
+                    f"--request {REMOTE_REQUEST} --output-dir {shlex.quote(remote_out)}{mock_flag}"
+                )
+                if pod.provider == "static_ssh":
+                    limit = float(
                         config.BENCH_TIMEOUT_S
                         if bench_timeout_s is None
                         else bench_timeout_s
-                    ),
-                    runner=runner,
-                    state_dir=registry.state_dir,
-                    check=False,
-                )
-            # The ssh return can beat the last poll interval; read the entry
-            # beacon one final time so a fast terminal failure still lands.
-            poller.final_read()
-            if result.stdout:
-                print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
-            if result.stderr:
-                print(result.stderr, end="" if result.stderr.endswith("\n") else "\n")
-
-            try:
-                pull(
+                    )
+                    # Bound the remote process too: a dead SSH client must not leave
+                    # a harness running indefinitely on a paid static machine.
+                    bench_cmd = (
+                        f"timeout --signal=TERM --kill-after=30s {limit:g}s "
+                        f"flock -w 120 {REMOTE_LOCK} sh -c {shlex.quote(bench_cmd)}"
+                    )
+                # ssh exec does not stream; poll the harness marker while it blocks.
+                poller = _PodPhasePoller(
                     pod,
-                    f"{remote_out}/",
-                    local_out,
+                    remote_out=remote_out,
+                    on_phase=phase,
                     runner=runner,
                     state_dir=registry.state_dir,
+                    on_entry_status=on_entry_status,
                 )
-            except GpuError as exc:
-                logger.warning("failed to pull bench output: %s", exc)
-
-            exit_code = int(result.exit_code)
-            if exit_code != 0:
-                break
-    except BaseException as exc:
-        pending = exc
-    finally:
-        if pod is not None:
-            if keep:
-                print(f"keep pod={pod.name}", flush=True)
-            else:
-                phase(BenchPhase.TEARDOWN.value)
-                _delete_remote_env(pod, runner=runner, state_dir=registry.state_dir)
-                try:
-                    destroy_pod(
+                with poller:
+                    result = ssh_exec(
                         pod,
-                        registry=registry,
-                        provider=provider,
+                        bench_cmd,
+                        timeout_s=float(
+                            config.BENCH_TIMEOUT_S
+                            if bench_timeout_s is None
+                            else bench_timeout_s
+                        ),
+                        runner=runner,
+                        state_dir=registry.state_dir,
+                        check=False,
+                    )
+                # The ssh return can beat the last poll interval; read the entry
+                # beacon one final time so a fast terminal failure still lands.
+                poller.final_read()
+                if result.stdout:
+                    print(
+                        result.stdout, end="" if result.stdout.endswith("\n") else "\n"
+                    )
+                if result.stderr:
+                    print(
+                        result.stderr, end="" if result.stderr.endswith("\n") else "\n"
+                    )
+
+                try:
+                    pull(
+                        pod,
+                        f"{remote_out}/",
+                        local_out,
+                        runner=runner,
                         state_dir=registry.state_dir,
                     )
-                except DestroyError as exc:
-                    destroy_failed = True
-                    logger.error(
-                        "DESTROY FAILED for pod=%s volume=%s provider=%s: %s. "
-                        "Destroy manually NOW in the provider dashboard "
-                        "(https://targon.com/rentals).",
-                        pod.name,
-                        (pod.raw or {}).get("volume_uid", ""),
-                        pod.provider,
-                        exc,
-                    )
-                    print(
-                        f"ERROR: destroy failed for {pod.name} "
-                        f"volume={(pod.raw or {}).get('volume_uid', '')} - "
-                        f"destroy manually NOW on the {pod.provider} dashboard",
-                        flush=True,
-                    )
+                except GpuError as exc:
+                    logger.warning("failed to pull bench output: %s", exc)
+
+                exit_code = int(result.exit_code)
+                if exit_code != 0:
+                    break
+        except BaseException as exc:
+            pending = exc
+        finally:
+            if pod is not None and (pod.provider != "static_ssh" or static_claimed):
+                if static_prepared:
+                    try:
+                        _static_host_cleanup(
+                            pod,
+                            candidates=set(),
+                            keep=baselines,
+                            runner=runner,
+                            state_dir=registry.state_dir,
+                        )
+                    except GpuError as exc:
+                        logger.error(
+                            "static host cleanup failed; retry before next round: %s",
+                            exc,
+                        )
+                        obs.static_host_cleanup_failed(pod=pod.name, error=str(exc))
+                if keep:
+                    print(f"keep pod={pod.name}", flush=True)
+                else:
+                    phase(BenchPhase.TEARDOWN.value)
+                    _delete_remote_env(pod, runner=runner, state_dir=registry.state_dir)
+                    try:
+                        destroy_pod(
+                            pod,
+                            registry=registry,
+                            provider=provider,
+                            state_dir=registry.state_dir,
+                        )
+                    except DestroyError as exc:
+                        destroy_failed = True
+                        logger.error(
+                            "DESTROY FAILED for pod=%s volume=%s provider=%s: %s. "
+                            "Destroy manually NOW in the provider dashboard "
+                            "(https://targon.com/rentals).",
+                            pod.name,
+                            (pod.raw or {}).get("volume_uid", ""),
+                            pod.provider,
+                            exc,
+                        )
+                        print(
+                            f"ERROR: destroy failed for {pod.name} "
+                            f"volume={(pod.raw or {}).get('volume_uid', '')} - "
+                            f"destroy manually NOW on the {pod.provider} dashboard",
+                            flush=True,
+                        )
 
     if destroy_failed:
         return EXIT_DESTROY_FAILED
