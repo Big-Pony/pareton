@@ -1,5 +1,6 @@
 """Standalone NVFP4 launch settings match a round with the same model. Offline."""
 
+import hashlib
 import json
 import runpy
 import subprocess
@@ -8,8 +9,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from tokenizers import Tokenizer, models
 
 from bench.main import scorer_engine_spec
+from bench.sampler import build_prompt_formatter
 from bench.schemas import EngineSpec
 from campaign.models import SLA
 from worker.round_job import build_round_request
@@ -18,23 +21,47 @@ pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_sample_request_matches_production_launch_and_scorer(tmp_path, monkeypatch):
+@pytest.mark.parametrize("embedded", [False, True])
+def test_sample_request_matches_production_launch_and_scorer(
+    tmp_path, monkeypatch, embedded
+):
     cache_root = tmp_path / "hf-cache"
     model_cache = (
         cache_root
-        / "nvidia--Qwen3.8-27B-NVFP4"
-        / "dbb8f445b3145f8a4c18ddc769f032d57d32867c"
+        / "RadixArk--Qwen3.8-27B-NVFP4-BF16-LMHead"
+        / "009632fef96dd349150baa780c984e62e70e91fe"
     )
     model_cache.mkdir(parents=True)
-    (model_cache / "tokenizer_config.json").write_text('{"model": "nvfp4"}')
-    (model_cache / "tokenizer.json").write_text("cached-nvfp4-tokenizer")
+    template = (
+        "{% for m in messages %}{{ m.content }}{% endfor %}"
+        "{% if enable_thinking %}<think>{% endif %}\r\n"
+    )
+    tokenizer_config = {"model": "nvfp4"}
+    if embedded:
+        tokenizer_config["chat_template"] = template
+    else:
+        (model_cache / "chat_template.jinja").write_bytes(template.encode("utf-8"))
+    (model_cache / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
+    tokenizer_json = Tokenizer(
+        models.WordLevel({"[UNK]": 0}, unk_token="[UNK]")
+    ).to_str()
+    (model_cache / "tokenizer.json").write_text(tokenizer_json)
     monkeypatch.setattr("config.BENCH_HF_CACHE_DIR", cache_root)
 
     def check_cached_tokenizer(rule, **kwargs):
-        assert kwargs["model_repo"] == "nvidia/Qwen3.8-27B-NVFP4"
-        assert kwargs["model_revision"] == "dbb8f445b3145f8a4c18ddc769f032d57d32867c"
-        assert kwargs["config_loader"]() == {"model": "nvfp4"}
-        assert kwargs["tokenizer_loader"]() == "cached-nvfp4-tokenizer"
+        assert kwargs["model_repo"] == "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead"
+        assert kwargs["model_revision"] == "009632fef96dd349150baa780c984e62e70e91fe"
+        assert kwargs["config_loader"]() == {
+            "model": "nvfp4",
+            "chat_template": template,
+        }
+        assert kwargs["tokenizer_loader"]() == tokenizer_json
+        formatter = build_prompt_formatter(rule, **kwargs)
+        assert "Explain binary search." in formatter.render("Explain binary search.")
+        assert formatter.receipt["chat_template"]["sha256"] == (
+            "sha256:" + hashlib.sha256(template.encode("utf-8")).hexdigest()
+        )
+        return formatter
 
     trace_path = tmp_path / "workload_trace.json"
     trace_path.write_text(
@@ -68,13 +95,13 @@ def test_sample_request_matches_production_launch_and_scorer(tmp_path, monkeypat
         (ROOT / "fixtures/campaigns/sglang_qwen38_27b/campaign-fields.json").read_text()
     )
     assert request["model"] == {
-        "hf_repo": "nvidia/Qwen3.8-27B-NVFP4",
-        "hf_revision": "dbb8f445b3145f8a4c18ddc769f032d57d32867c",
+        "hf_repo": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
+        "hf_revision": "009632fef96dd349150baa780c984e62e70e91fe",
         "dtype": "bfloat16",
-        "quantization": None,
+        "quantization": "modelopt_mixed",
         "max_model_len": 262144,
     }
-    fields["bench"]["model"] = request["model"]
+    assert request["model"] == fields["bench"]["model"]
     production = build_round_request(
         {
             "gpu_sku": "RTX5090",
@@ -98,11 +125,18 @@ def test_sample_request_matches_production_launch_and_scorer(tmp_path, monkeypat
             ("--model-path", "/model"),
             ("--context-length", "262144"),
             ("--dtype", "bfloat16"),
+            ("--kv-cache-dtype", "bfloat16"),
         ):
             assert args[args.index(flag) + 1] == value
-        assert "--quantization" not in args
+        assert args[args.index("--quantization") + 1] == "modelopt_mixed"
     scorer = scorer_engine_spec(EngineSpec.from_dict(request["engines"]["baseline"]))
-    assert "--quantization" not in scorer.serve_args
+    assert (
+        scorer.serve_args[scorer.serve_args.index("--kv-cache-dtype") + 1] == "bfloat16"
+    )
+    assert (
+        scorer.serve_args[scorer.serve_args.index("--quantization") + 1]
+        == "modelopt_mixed"
+    )
     assert (
         scorer.serve_args[scorer.serve_args.index("--context-length") + 1] == "262151"
     )

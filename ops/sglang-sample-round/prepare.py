@@ -29,25 +29,31 @@ fields = json.loads(
 )
 bench = fields["bench"]
 model = bench["model"]
-# This standalone sample uses NVIDIA's mixed FP8/NVFP4 checkpoint. Let SGLang
-# detect its per-layer quantization from config.json instead of forcing FP8.
-model.update(
-    hf_repo="nvidia/Qwen3.8-27B-NVFP4",
-    hf_revision="dbb8f445b3145f8a4c18ddc769f032d57d32867c",
-    quantization=None,
-)
 cache = (
     config.BENCH_HF_CACHE_DIR
     / model["hf_repo"].replace("/", "--")
     / model["hf_revision"]
 )
 rule = fields["sampling_rule"]
+
+
+def load_cached_tokenizer_config(**_):
+    with (cache / "tokenizer_config.json").open(encoding="utf-8") as fh:
+        tokenizer_config = json.load(fh)
+    if not isinstance(tokenizer_config, dict):
+        raise TypeError("tokenizer_config.json must contain an object")
+    if not tokenizer_config.get("chat_template"):
+        with (cache / "chat_template.jinja").open(encoding="utf-8", newline="") as fh:
+            tokenizer_config["chat_template"] = fh.read()
+    return tokenizer_config
+
+
 logger.info("Loading pinned tokenizer from %s", cache)
 formatter = build_prompt_formatter(
     rule,
     model_repo=model["hf_repo"],
     model_revision=model["hf_revision"],
-    config_loader=lambda **_: json.loads((cache / "tokenizer_config.json").read_text()),
+    config_loader=load_cached_tokenizer_config,
     tokenizer_loader=lambda **_: (cache / "tokenizer.json").read_text(),
 )
 trace_path = root / "workload_trace.json"
