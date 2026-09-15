@@ -17,7 +17,7 @@ from gpu.orchestrate import provision_pod, run_bench_on_pod
 from gpu.providers import provider_order
 from gpu.reap import reap
 from gpu.registry import PodRegistry, RegistryEntry, encode_pod_name
-from gpu.static_host import HOST_BUSY_EXIT, HostBusyError
+from gpu.static_host import HOST_BUSY_EXIT, IMAGE_RETRY_EXIT, HostBusyError
 from gpu.ssh import SshResult
 from gpu.types import Offer, Pod, PodSpec, SshTarget
 
@@ -2113,3 +2113,49 @@ def test_reaper_racing_bootstrap_defers_only_lock_contention(
     if cleanup_exit == HOST_BUSY_EXIT:
         assert stages == ["bootstrap", "cleanup"]
         assert not provider.destroy_calls
+
+
+def test_image_cleanup_retry_alerts_without_blocking_static_round(
+    tmp_path, monkeypatch
+):
+    provider = FakeProvider()
+    provider.name = "static_ssh"
+    stages = []
+    alerts = []
+    monkeypatch.setattr("gpu.orchestrate.bootstrap_pod", lambda *a, **k: "sha")
+    for name in ("push", "pull", "_write_remote_env", "_delete_remote_env"):
+        monkeypatch.setattr(f"gpu.orchestrate.{name}", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "gpu.orchestrate.pull_engine_images", lambda *a, **k: stages.append("pull")
+    )
+    monkeypatch.setattr(
+        "gpu.orchestrate.obs.static_host_cleanup_failed", lambda **k: alerts.append(k)
+    )
+
+    def runner(cmd, **kwargs):
+        command = " ".join(cmd)
+        if "python3 -m gpu.static_host" in command:
+            stages.append("cleanup")
+            return SshResult(
+                IMAGE_RETRY_EXIT,
+                "",
+                "candidate image cleanup needs retry: image in use",
+            )
+        if "python -m bench" in command:
+            stages.append("bench")
+        return SshResult(0, "", "")
+
+    assert (
+        run_bench_on_pod(
+            PodSpec(provider="static_ssh"),
+            request_path=SAMPLE_REQUEST,
+            output_dir=tmp_path / "out",
+            state_dir=tmp_path / "state",
+            provider=provider,
+            runner=runner,
+        )
+        == 0
+    )
+    assert stages == ["cleanup", "pull", "bench", "cleanup"]
+    assert len(alerts) == 2
+    assert all("image in use" in alert["error"] for alert in alerts)

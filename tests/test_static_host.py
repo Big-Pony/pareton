@@ -89,10 +89,33 @@ def test_failed_image_removal_stays_tracked_without_force(tmp_path):
         "busy": "image in use",
         "already-gone": "No such image: already-gone",
     }
-    with pytest.raises(RuntimeError, match="image in use"):
-        cleanup(tracked_path=tracked, candidates={"next"}, keep=set(), docker=docker)
+    failures = cleanup(
+        tracked_path=tracked, candidates={"next"}, keep=set(), docker=docker
+    )
+    assert failures == ["image in use"]
     assert json.loads(tracked.read_text()) == ["busy", "next"]
     assert all("-f" not in c for c in docker.calls if c[:2] == ("image", "rm"))
+    # A sticky image does not prevent registering later rounds; retry succeeds
+    # once the external reference is released.
+    assert cleanup(
+        tracked_path=tracked, candidates={"later"}, keep={"later"}, docker=docker
+    ) == ["image in use"]
+    assert json.loads(tracked.read_text()) == ["busy", "later"]
+    docker.fail_images.clear()
+    assert (
+        cleanup(tracked_path=tracked, candidates=set(), keep={"later"}, docker=docker)
+        == []
+    )
+    assert json.loads(tracked.read_text()) == ["later"]
+
+
+def test_cleanup_cli_distinguishes_image_retry(tmp_path, monkeypatch, caplog):
+    from gpu import static_host
+
+    monkeypatch.setattr(static_host, "REMOTE_LOCK", str(tmp_path / "host.lock"))
+    monkeypatch.setattr(static_host, "cleanup", lambda **kw: ["image in use"])
+    assert static_host.main([]) == static_host.IMAGE_RETRY_EXIT
+    assert "candidate image cleanup needs retry" in caplog.text
 
 
 def test_container_cleanup_failure_stops_preparation(tmp_path):

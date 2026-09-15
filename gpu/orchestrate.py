@@ -51,6 +51,7 @@ from gpu.registry import (
 from gpu.ssh import REPO_RSYNC_EXCLUDES, SshRunner, exec as ssh_exec, pull, push
 from gpu.static_host import (
     HOST_BUSY_EXIT,
+    IMAGE_RETRY_EXIT,
     REMOTE_LOCK,
     HostBusyError,
     bounded_bench_command,
@@ -293,6 +294,11 @@ def _static_host_cleanup(
     )
     if result.exit_code == HOST_BUSY_EXIT:
         raise NoCapacityError("static GPU host is busy with maintenance or another run")
+    if result.exit_code == IMAGE_RETRY_EXIT:
+        error = (result.stderr or result.stdout).strip()[-800:]
+        logger.warning("static host image cleanup deferred: %s", error)
+        obs.static_host_cleanup_failed(pod=pod.name, error=error)
+        return
     if result.exit_code:
         raise GpuError(
             f"static host cleanup failed (exit {result.exit_code}): "

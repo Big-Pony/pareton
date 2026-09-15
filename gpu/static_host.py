@@ -22,6 +22,7 @@ from typing import Iterator
 
 logger = logging.getLogger(__name__)
 HOST_BUSY_EXIT = 75  # Reserved flock conflict status, distinct from SSH/OS failures.
+IMAGE_RETRY_EXIT = 76  # Storage cleanup incomplete; host preparation succeeded.
 REMOTE_LOCK = "/opt/pareton/.static-host.lock"
 REMOTE_IMAGES = "/opt/pareton/.static-host-images.json"
 _CONTAINER = re.compile(r"^pareton-bench-[0-9a-f]{12}-[a-zA-Z0-9_.-]+$")
@@ -135,11 +136,12 @@ def cleanup(
     docker=_docker,
     output_root: Path = Path("/opt/pareton/out"),
     collected_output: str | None = None,
-) -> None:
+) -> list[str]:
     """Reclaim previous rounds, then register candidates before they are pulled.
 
     Failed image removals remain tracked for the next attempt. Never force image
-    deletion: an unrelated container may still reference the same image.
+    deletion: an unrelated container may still reference the same image. Return
+    image-removal failures for alerting without blocking the next evaluation.
     """
     if collected_output is not None and not _OUTPUT.fullmatch(collected_output):
         raise ValueError("collected output must name one static run directory")
@@ -170,10 +172,7 @@ def cleanup(
         child = output_root / collected_output
         if child.is_dir() and not child.is_symlink():
             shutil.rmtree(child)
-    if failures:
-        raise RuntimeError(
-            "candidate image cleanup needs retry: " + "; ".join(failures)
-        )
+    return failures
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -189,12 +188,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         with host_lock(Path(REMOTE_LOCK)):
-            cleanup(
+            failures = cleanup(
                 tracked_path=Path(REMOTE_IMAGES),
                 candidates=_image_refs(json.loads(args.candidates)),
                 keep=_image_refs(json.loads(args.keep)),
                 collected_output=args.collected_output,
             )
+            if failures:
+                logger.warning(
+                    "candidate image cleanup needs retry: %s", "; ".join(failures)
+                )
+                return IMAGE_RETRY_EXIT
     except HostBusyError as exc:
         logger.info("%s", exc)
         return HOST_BUSY_EXIT
