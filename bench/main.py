@@ -99,6 +99,9 @@ CORRECTNESS_EXTRA_SERVE_ARGS = [
     "--no-enable-prefix-caching",
     "--no-enable-flashinfer-autotune",
 ]
+# The pinned vLLM generation runner requires an output slot even for echo-only
+# scoring. Reserve it beyond the replay context for a full-length forced input.
+VLLM_SCORER_CONTEXT_HEADROOM = 1
 # At the pinned SGLang commit, max_req_input_len is context_length - 6
 # and inputs must be strictly shorter. Reserve seven slots for a scorer
 # input that fills the replay context, including room for the clamp token.
@@ -133,23 +136,26 @@ def scorer_engine_spec(spec: EngineSpec) -> EngineSpec:
     args = list(spec.serve_args)
     env = dict(spec.env)
     if spec.name == "sglang":
-        # The worker pins a numeric --context-length. Cover argparse's = form
-        # too, and preserve duplicate flags' last-value-wins behavior.
-        for i, arg in enumerate(spec.serve_args):
-            if arg == "--context-length":
-                args[i + 1] = str(
-                    int(spec.serve_args[i + 1]) + SGLANG_SCORER_CONTEXT_HEADROOM
-                )
-            elif arg.startswith("--context-length="):
-                args[i] = "--context-length=" + str(
-                    int(arg.partition("=")[2]) + SGLANG_SCORER_CONTEXT_HEADROOM
-                )
-            else:
-                continue
-            # Only the scorer allocates beyond a model's declared context.
-            # Forced input positions still fit the original replay window;
-            # the one sampled token is excluded and never fed back to the model.
-            env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
+        context_flag = "--context-length"
+        headroom = SGLANG_SCORER_CONTEXT_HEADROOM
+        override_env = "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"
+    else:
+        context_flag = "--max-model-len"
+        headroom = VLLM_SCORER_CONTEXT_HEADROOM
+        override_env = "VLLM_ALLOW_LONG_MAX_MODEL_LEN"
+    # The worker pins a numeric context limit. Cover argparse's = form too,
+    # and preserve duplicate flags' last-value-wins behavior.
+    for i, arg in enumerate(spec.serve_args):
+        if arg == context_flag:
+            args[i + 1] = str(int(spec.serve_args[i + 1]) + headroom)
+        elif arg.startswith(context_flag + "="):
+            args[i] = context_flag + "=" + str(int(arg.partition("=")[2]) + headroom)
+        else:
+            continue
+        # Only the scorer allocates beyond a model's declared context.
+        # Forced input positions still fit the original replay window;
+        # the one sampled token is excluded and never fed back to the model.
+        env[override_env] = "1"
     return EngineSpec(
         image=spec.image,
         serve_args=args + extra,
@@ -550,6 +556,18 @@ def run_round(
         entry_statuses[key] = {"status": status, "reason": reason}
         layout.write_entry_statuses(entry_statuses)
 
+    def preflight(url: str, start: EngineStart) -> None:
+        from bench.workload_preflight import validate_engine_workload
+
+        validate_engine_workload(
+            url,
+            trace,
+            engine_name=start.spec.name,
+            max_model_len=req.model.max_model_len,
+            evidence_dir=layout.sla_bench_dir / start.role,
+            verify_tokenizer=start.kind == "baseline",
+        )
+
     for start in plan:
         if leader_failed and start.kind == "candidate":
             # A leader infra failure voids the round at ranking time, so
@@ -570,6 +588,7 @@ def run_round(
             phase = BenchPhase.SLA_BENCH
             try:
                 with provider.start(start, phase=phase) as url:
+                    preflight(url, start)
                     replay = run_sla_engine(
                         url,
                         role=start.role,
@@ -623,6 +642,7 @@ def run_round(
             note(str(index), "running")
             try:
                 with provider.start(start, phase=BenchPhase.SLA_BENCH) as url:
+                    preflight(url, start)
                     replay = run_sla_engine(
                         url,
                         role=start.role,
@@ -847,11 +867,16 @@ def baseline_drift(
     Drift is ``last_baseline_score - first_baseline_score``. The opening
     baseline scores 0.0 against itself under any speedup rule, so the
     difference is exactly the closing run's score. Positive means the pod got
-    faster while the round ran; negative, slower. A round whose drift is too
+    faster while the round ran; negative, slower. The miner reliability
+    deduction does not alter this hardware-drift diagnostic. A round whose drift is too
     large was not measuring the candidates.
     """
     return score_candidate(
-        req.scoring_rule,
+        {
+            key: value
+            for key, value in req.scoring_rule.items()
+            if key != "failure_penalty"
+        },
         baseline=baseline.result.timings,
         candidate=drift.result.timings,
     ).score
