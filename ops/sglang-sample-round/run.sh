@@ -7,8 +7,8 @@ log() {
 trap 'log "ERROR: phase=$phase line=$LINENO exit=$?" >&2' ERR
 script_root="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_root/../.." && pwd)"
-mkdir -p "${1:-/workspace/pareton-sample-round}"
-run_root="$(cd "${1:-/workspace/pareton-sample-round}" && pwd)"
+mkdir -p "${1:-/workspace/pareton-sample-round-nvfp4}"
+run_root="$(cd "${1:-/workspace/pareton-sample-round-nvfp4}" && pwd)"
 mkdir -p /opt/pareton
 exec 9>/opt/pareton/.static-host.lock
 log "Acquiring static-host lock; output directory: $run_root"

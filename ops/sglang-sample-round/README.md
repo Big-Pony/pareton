@@ -1,7 +1,15 @@
-# Standalone SGLang sample round
+# Standalone SGLang NVFP4 sample round
 
 Build the included comment-only patch and evaluate it on the warmed, dedicated
 GPU VM without creating a campaign or writing to the database or chain.
+
+The sample uses [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4/tree/dbb8f445b3145f8a4c18ddc769f032d57d32867c)
+at revision `dbb8f445b3145f8a4c18ddc769f032d57d32867c`. Finish caching it
+before starting the runner; its tokenizer is read from:
+
+```text
+/workspace/hf-cache/nvidia--Qwen3.8-27B-NVFP4/dbb8f445b3145f8a4c18ddc769f032d57d32867c
+```
 
 ## Run
 
@@ -23,14 +31,16 @@ mkdir -p /workspace/pareton-sample-source
 tar -xzf /workspace/pareton-sample-source.tar.gz -C /workspace/pareton-sample-source
 cd /workspace/pareton-sample-source
 nohup bash ops/sglang-sample-round/run.sh \
-  > /workspace/pareton-sample-round.log 2>&1 < /dev/null &
-tail -f /workspace/pareton-sample-round.log
+  > /workspace/pareton-sample-round-nvfp4.log 2>&1 < /dev/null &
+tail -f /workspace/pareton-sample-round-nvfp4.log
 ```
 
-The runner uses `/workspace/pareton-sample-round` for its virtual environment,
+The runner uses `/workspace/pareton-sample-round-nvfp4` for its virtual environment,
 request, trace, build log and reports. Pass a different output directory as its
 first argument to generate a fresh sample directory. Rerunning with the same
 directory reuses the sampled trace and writes a new timestamped report directory.
+Use a fresh directory when switching models; do not pass an old FP8 sample
+directory, because its trace was prepared with a different pinned tokenizer.
 
 The VM needs Python 3 with venv support, Git, Docker with the NVIDIA runtime,
 `flock`, and four available RTX5090 GPUs. Run as root. Internet access is required
@@ -44,11 +54,14 @@ needed.
   `4c3d47f1df9dee2d77794f6fc5ef11c64817e4fc`, using the cached baseline runtime
   digest `43d5d33c2d3f61923d7ff96b8c69b77b8ddee28f749c10bb876ed538169fd431`.
   The candidate stays local as `pareton-sample:sglang-minimal`.
-- Follow [the campaign fixture](../../fixtures/campaigns/sglang_qwen38_27b/campaign-fields.json):
-  four RTX5090 GPUs, pinned Qwen3.8-27B-FP8 weights, 262144 context configuration,
+- Use the workload and hardware settings from
+  [the campaign fixture](../../fixtures/campaigns/sglang_qwen38_27b/campaign-fields.json),
+  with the sample's NVFP4 model override: four RTX5090 GPUs, 262144 context configuration,
   32 sampled prompts across the 4K/8K/16K/32K input tiers, and three timing
   repetitions by default.
-- Run baseline, candidate, FP8 correctness scoring, and baseline drift replay.
+- Auto-detect the checkpoint's mixed FP8/NVFP4 quantization from its model
+  configuration (`quantization: null` in the request, no `--quantization` flag).
+- Run baseline, candidate, NVFP4 correctness scoring, and baseline drift replay.
   The fixed local sampling seed is reproducible. It does not represent a
   chain-selected production round or test a full 262K input window.
 - Reuse `/workspace/hf-cache` and `/workspace/engine-cache`. Local Docker image
