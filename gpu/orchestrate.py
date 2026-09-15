@@ -49,7 +49,7 @@ from gpu.registry import (
     parse_pod_name,
 )
 from gpu.ssh import REPO_RSYNC_EXCLUDES, SshRunner, exec as ssh_exec, pull, push
-from gpu.static_host import REMOTE_LOCK, host_lock
+from gpu.static_host import HOST_BUSY_EXIT, REMOTE_LOCK, HostBusyError, host_lock
 from gpu.types import Pod, PodSpec, SshTarget
 from observability import events as obs
 from round.rank import ENTRY_STATUSES
@@ -262,13 +262,24 @@ def _engine_image_refs(req) -> list[str]:
 
 
 def _static_host_cleanup(
-    pod: Pod, *, candidates: set[str], keep: set[str], runner, state_dir: Path
+    pod: Pod,
+    *,
+    candidates: set[str],
+    keep: set[str],
+    runner,
+    state_dir: Path,
+    collected_output: str | None = None,
 ) -> None:
+    output_arg = (
+        f" --collected-output {shlex.quote(collected_output)}"
+        if collected_output
+        else ""
+    )
     result = ssh_exec(
         pod,
         f"cd {REMOTE_REPO} && python3 -m gpu.static_host "
         f"--candidates {shlex.quote(json.dumps(sorted(candidates)))} "
-        f"--keep {shlex.quote(json.dumps(sorted(keep)))}",
+        f"--keep {shlex.quote(json.dumps(sorted(keep)))}{output_arg}",
         timeout_s=600.0,
         runner=runner,
         state_dir=state_dir,
@@ -809,6 +820,7 @@ def run_bench_on_pod(
     destroy_failed = False
     pending: BaseException | None = None
 
+    collected_output = None
     static_prepared = False
     static_claimed = False
     resources = ExitStack()
@@ -836,19 +848,25 @@ def run_bench_on_pod(
                 resources.enter_context(
                     host_lock(registry.state_dir / f"static-{token}.lock")
                 )
-            except RuntimeError as exc:
-                raise GpuError(str(exc)) from exc
+            except HostBusyError as exc:
+                raise NoCapacityError(str(exc)) from exc
             # A harness surviving its SSH client must finish before bootstrap
             # rewrites its Python environment or cleanup touches its containers.
-            ssh_exec(
+            probe = ssh_exec(
                 pod,
-                f"if test -e {REMOTE_LOCK}; then flock -w 120 {REMOTE_LOCK} true || "
-                "{ echo 'static GPU host is busy or its lock is unavailable' >&2; "
-                "exit 1; }; fi",
-                timeout_s=150.0,
+                f"if test -e {REMOTE_LOCK}; then "
+                f"flock -n -E {HOST_BUSY_EXIT} {REMOTE_LOCK} true; fi",
+                timeout_s=30.0,
                 runner=runner,
                 state_dir=registry.state_dir,
+                check=False,
             )
+            if probe.exit_code == HOST_BUSY_EXIT:
+                raise NoCapacityError(
+                    "static GPU host is busy with another Pareton run"
+                )
+            if probe.exit_code:
+                raise GpuError(f"static host lock probe failed: {probe.stderr.strip()}")
             static_claimed = True
         phase(BenchPhase.BOOTSTRAPPING.value)
         code_sha = bootstrap_pod(
@@ -887,6 +905,7 @@ def run_bench_on_pod(
                 state_dir=registry.state_dir,
             )
 
+        outputs_pulled = True
         mock_flag = " --mock-engine" if mock_engine else ""
         for job_index, (req_p, local_out, _req, trace_path) in enumerate(
             preflighted, start=1
@@ -930,7 +949,7 @@ def run_bench_on_pod(
                 # a harness running indefinitely on a paid static machine.
                 bench_cmd = (
                     f"timeout --signal=TERM --kill-after=30s {limit:g}s "
-                    f"flock -w 120 {REMOTE_LOCK} sh -c {shlex.quote(bench_cmd)}"
+                    f"flock -w 120 -E {HOST_BUSY_EXIT} {REMOTE_LOCK} sh -c {shlex.quote(bench_cmd)}"
                 )
             # ssh exec does not stream; poll the harness marker while it blocks.
             poller = _PodPhasePoller(
@@ -954,6 +973,12 @@ def run_bench_on_pod(
                     state_dir=registry.state_dir,
                     check=False,
                 )
+            if pod.provider == "static_ssh" and result.exit_code == HOST_BUSY_EXIT:
+                # No harness started; leave the other lock owner's resources alone.
+                static_claimed = False
+                raise NoCapacityError(
+                    "static GPU host is busy with another Pareton run"
+                )
             # The ssh return can beat the last poll interval; read the entry
             # beacon one final time so a fast terminal failure still lands.
             poller.final_read()
@@ -971,11 +996,14 @@ def run_bench_on_pod(
                     state_dir=registry.state_dir,
                 )
             except GpuError as exc:
+                outputs_pulled = False
                 logger.warning("failed to pull bench output: %s", exc)
 
             exit_code = int(result.exit_code)
             if exit_code != 0:
                 break
+        if pod.provider == "static_ssh" and outputs_pulled:
+            collected_output = f"static-{pod.name}"
     except BaseException as exc:
         pending = exc
     finally:
@@ -988,6 +1016,7 @@ def run_bench_on_pod(
                             pod,
                             candidates=set(),
                             keep=baselines,
+                            collected_output=collected_output,
                             runner=runner,
                             state_dir=registry.state_dir,
                         )

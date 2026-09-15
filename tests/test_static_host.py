@@ -41,6 +41,9 @@ def test_cleanup_reclaims_only_owned_resources(tmp_path):
     stale = output / "static-pt-20260915120000-2h-0123abcd"
     stale.mkdir(parents=True)
     (stale / "report.json").write_text("old")
+    uncollected = output / "static-pt-20260915110000-2h-fedcba98"
+    uncollected.mkdir()
+    (uncollected / "report.json").write_text("only copy")
     (output / "operator-report").mkdir()
     docker = Docker()
     cleanup(
@@ -60,7 +63,7 @@ def test_cleanup_reclaims_only_owned_resources(tmp_path):
         "current-candidate",
         "next-candidate",
     }
-    assert not stale.exists()
+    assert (stale / "report.json").read_text() == "old"
     assert (output / "operator-report").is_dir()
     assert not any("other-app" in call or "bridge" in call for call in docker.calls)
 
@@ -70,7 +73,10 @@ def test_cleanup_reclaims_only_owned_resources(tmp_path):
         keep={"baseline"},
         docker=docker,
         output_root=output,
+        collected_output=stale.name,
     )
+    assert not stale.exists()
+    assert (uncollected / "report.json").read_text() == "only copy"
     assert json.loads(tracked.read_text()) == ["baseline"]
     assert ("image", "rm", "baseline") not in docker.calls
 
@@ -131,6 +137,11 @@ def test_host_lock_refuses_overlap_and_releases_after_failure(tmp_path):
         (["NVIDIA H200", "NVIDIA GeForce RTX 5090"], "RTX5090", 1, False),
         ([], "RTX5090", 4, False),
         (["NVIDIA H1000"], "H100", 1, False),
+        (["NVIDIA H200-SXM-141GB"], "H200", 1, True),
+        (["NVIDIA H200 NVL"], "NVIDIA-H200", 1, True),
+        (["NVIDIA H100 80GB HBM3"], "H100", 1, True),
+        (["NVIDIA H1000 80GB HBM3"], "H100", 1, False),
+        (["NVIDIA GeForce RTX 50900"], "RTX5090", 1, False),
     ],
 )
 def test_static_provider_checks_real_hardware(

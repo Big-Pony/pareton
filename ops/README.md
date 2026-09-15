@@ -238,16 +238,22 @@ Bootstrap still recreates the remote Python environment each round.
 
 Each round removes abandoned Pareton bench containers, anonymous volumes and
 networks before image pulls, then removes candidate images and temporary outputs
-after collecting results. Only Pareton bench names and candidate references in
+after collecting results. Output deletion is limited to the current run and
+requires every attempted download to succeed. Failed transfers or lost SSH
+sessions leave reports on the GPU node for manual recovery; later rounds and the
+periodic reaper preserve them. Retrieve these reports before removing them.
+Only Pareton bench names and candidate references in
 `/opt/pareton/.static-host-images.json` are reclaimed. Keep this ledger across
 restarts; failed image deletions remain tracked for retry. Current baseline
 images, model downloads and baseline compile caches are preserved. Inspect older,
 untracked images separately. No separate daily image-pruning job is needed.
 
 Local locking prevents overlapping workers. Remote locking protects active
-harnesses from cleanup and prevents bootstrap over a surviving harness. A remote
-harness has the configured benchmark timeout plus a 30-second kill grace period;
-a new harness waits up to 120 seconds for maintenance.
+harnesses from cleanup and prevents bootstrap over a surviving harness. Busy
+hosts defer the round using `PARETON_PROVISION_RETRY_S`, preserving its cohort and
+seed. SSH or lock-system failures still fail the round. A remote harness has the
+configured benchmark timeout plus a 30-second kill grace period; a new harness
+waits up to 120 seconds for maintenance, then defers if the lock remains held.
 
 The existing **`pareton-gpu-reap.timer` runs on the validator VPS every 10 minutes**
 and SSHes to the configured node. Enable it and deploy updated code on both hosts

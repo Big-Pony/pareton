@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from gpu.errors import ProvisionError
+from gpu.providers.lium import _gpu_type_matches
 from gpu.ssh import exec as ssh_exec
 from gpu.types import Offer, Pod, PodSpec, SshTarget
 
@@ -106,7 +107,11 @@ class StaticSshProvider:
         count = int(offer.raw.get("gpu_count", offer.gpu_count))
         expected = str(offer.raw.get("gpu_type", offer.gpu_type) or "")
         if len(names) < count or (
-            expected and any(_gpu_name(name) != _gpu_name(expected) for name in names)
+            expected
+            and any(
+                not _gpu_type_matches(_gpu_name(name), _gpu_name(expected))
+                for name in names
+            )
         ):
             raise ProvisionError(
                 f"static_ssh hardware mismatch: requested {count}x {expected or 'GPU'}, "
@@ -133,4 +138,5 @@ class StaticSshProvider:
 
 def _gpu_name(value: str) -> str:
     value = re.sub(r"\b(nvidia|geforce)\b", "", value.lower())
-    return re.sub(r"[^a-z0-9]", "", value)
+    value = re.sub(r"\brtx[\s_-]*(?=\d)", "rtx", value)
+    return " ".join(re.findall(r"[a-z0-9]+", value))

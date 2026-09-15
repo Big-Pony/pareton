@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Iterator
 
 logger = logging.getLogger(__name__)
+HOST_BUSY_EXIT = 75  # Reserved flock conflict status, distinct from SSH/OS failures.
 REMOTE_LOCK = "/opt/pareton/.static-host.lock"
 REMOTE_IMAGES = "/opt/pareton/.static-host-images.json"
 _CONTAINER = re.compile(r"^pareton-bench-[0-9a-f]{12}-[a-zA-Z0-9_.-]+$")
@@ -120,12 +121,15 @@ def cleanup(
     keep: set[str],
     docker=_docker,
     output_root: Path = Path("/opt/pareton/out"),
+    collected_output: str | None = None,
 ) -> None:
     """Reclaim previous rounds, then register candidates before they are pulled.
 
     Failed image removals remain tracked for the next attempt. Never force image
     deletion: an unrelated container may still reference the same image.
     """
+    if collected_output is not None and not _OUTPUT.fullmatch(collected_output):
+        raise ValueError("collected output must name one static run directory")
     tracked = (
         _image_refs(json.loads(tracked_path.read_text()))
         if tracked_path.exists()
@@ -147,14 +151,12 @@ def cleanup(
     tmp = tracked_path.with_suffix(".tmp")
     tmp.write_text(json.dumps(sorted(tracked)) + "\n")
     tmp.replace(tracked_path)
-    if output_root.is_dir():
-        for child in output_root.iterdir():
-            if (
-                _OUTPUT.fullmatch(child.name)
-                and child.is_dir()
-                and not child.is_symlink()
-            ):
-                shutil.rmtree(child)
+    # Delete only this run after every attempted output pull succeeded. Older
+    # directories may hold the only copy of a report after a worker/SSH failure.
+    if collected_output is not None:
+        child = output_root / collected_output
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
     if failures:
         raise RuntimeError(
             "candidate image cleanup needs retry: " + "; ".join(failures)
@@ -166,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--candidates", default="[]")
     parser.add_argument("--keep", default="[]")
     parser.add_argument("--idle-containers", action="store_true")
+    parser.add_argument("--collected-output")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     if args.idle_containers:
@@ -176,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
             tracked_path=Path(REMOTE_IMAGES),
             candidates=_image_refs(json.loads(args.candidates)),
             keep=_image_refs(json.loads(args.keep)),
+            collected_output=args.collected_output,
         )
     return 0
 
