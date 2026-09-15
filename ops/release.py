@@ -595,8 +595,14 @@ def gpu_probe_flow(op_id: str, probe: dict) -> None:
         ONESHOT_UNITS[:1], budget_s=gpu_reap_wait_s(), step="gpu-reap-wait"
     )
     if pending:
+        failure_step = "gpu-reap-wait-timeout"
+        mutate_state(
+            lambda s: s.update({"log_accepted": False, "failure_step": failure_step})
+        )
         _restore_maint_timers(load_state())
-        raise Fail(1, "gpu-reap-wait-timeout", units=pending)
+        _finish_request("failed", {"step": failure_step})
+        clear_coordination_files()
+        raise Fail(1, failure_step, units=pending)
     request = {
         "invocation_id": os.environ.get("INVOCATION_ID", "manual"),
         "op_id": op_id,
@@ -2380,10 +2386,22 @@ def _request_vector_repair(state: dict, request: dict) -> int:
         )
         return 1
 
-    def retarget(s: dict) -> None:
-        s["target_commit"] = repair_target
-        s["vector_repair_from"] = state["target_commit"]
-
+    # Persist the install intent before changing HEAD or starting a process
+    # that can be interrupted. The normal applying recovery frees the request
+    # slot and resumes C without losing the original recovery copy for A.
+    mutate_state(
+        lambda s: s.update(
+            {
+                "phase": "applying",
+                "scope": "vector-only",
+                "target_commit": repair_target,
+                "vector_repair_from": state["target_commit"],
+                "log_accepted": False,
+                "failure_step": None,
+                "phase_since": now_iso(),
+            }
+        )
+    )
     _mark_request_running(request)
     git_out("reset", "--hard", repair_target)
     result = run_cmd(
@@ -2418,7 +2436,7 @@ def _request_vector_repair(state: dict, request: dict) -> int:
         _finish_request("failed", {"step": failure_step})
         record_step("vector-repair-install-failed")
         return 2
-    mutate_state(retarget)
+    mutate_state(lambda s: s.update({"phase": "verifying", "phase_since": now_iso()}))
     if not _current_environment_healthy():
         _mark_health_check_failed()
         return 2

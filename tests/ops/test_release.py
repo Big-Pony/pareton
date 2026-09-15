@@ -2558,3 +2558,87 @@ def test_unpause_always_resumes_automatic_deploys(base):
 
 
 DEPLOY_TIMER_TEST = "pareton-deploy.timer"
+
+
+@pytest.mark.parametrize("interrupt_at", ["reset", "install"])
+def test_interrupted_vector_repair_preserves_recovery_and_frees_request(
+    base, monkeypatch, interrupt_at
+):
+    write_state(
+        base,
+        phase="verifying",
+        target_commit="B",
+        verified_commit="A",
+        startup_complete=True,
+        failure_step="log-ingestion",
+        recovery_copy="/saved/A",
+        recovery_commit="A",
+    )
+    runner = release.run_cmd
+    runner.git_refs = {"HEAD": "B", "C": "C"}
+    runner.git_diff = "ops/vector/vector.toml\n"
+    assert release.cmd_request(["vector-repair", "--target", "C"]) == 0
+
+    def interrupted(argv, **kwargs):
+        resetting = argv[0] == "git" and "reset" in argv
+        installing = (
+            any(str(a).endswith("sync-config.py") for a in argv) and "apply" in argv
+        )
+        if resetting:
+            runner.git_refs["HEAD"] = "C"
+        if (interrupt_at == "reset" and resetting) or (
+            interrupt_at == "install" and installing
+        ):
+            raise KeyboardInterrupt
+        return runner(argv, **kwargs)
+
+    monkeypatch.setattr(release, "run_cmd", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        release.tick([])
+    monkeypatch.setattr(release, "run_cmd", runner)
+    assert release.tick([]) == 2
+    state = read_state(base)
+    assert (state["phase"], state["scope"], state["target_commit"]) == (
+        "applying",
+        "vector-only",
+        "C",
+    )
+    assert (
+        state["verified_commit"],
+        state["recovery_copy"],
+        state["vector_repair_from"],
+    ) == ("A", "/saved/A", "B")
+    request = release.read_json(release.request_path())
+    assert request["status"] == "failed"
+    assert request["result"]["step"] == "applying-interrupted"
+    assert release.cmd_request(["resume"]) == 0
+
+
+def test_verify_gpu_timeout_parks_without_automatic_retry(base, monkeypatch):
+    write_state(
+        base,
+        log_accepted=True,
+        original_units={"pareton-gpu-reap.timer": {"active": True}},
+    )
+    monkeypatch.setattr(release, "_current_environment_healthy", lambda: True)
+    monkeypatch.setenv("PARETON_GPU_REAP_WAIT_S", "0")
+    release.run_cmd.active_units = {
+        "pareton-gpu-reap.service",
+        "pareton-gpu-reap.timer",
+    }
+    assert release.cmd_request(["verify"]) == 0
+    assert release.main(["tick"]) == 1
+    state = read_state(base)
+    assert (
+        state["phase"],
+        state["startup_complete"],
+        state["log_accepted"],
+        state["failure_step"],
+    ) == ("verifying", True, False, "gpu-reap-wait-timeout")
+    assert release.read_json(release.request_path())["status"] == "failed"
+    assert ["systemctl", "start", "pareton-gpu-reap.timer"] in release.run_cmd.calls
+    assert not release.probe_path().exists()
+    release.run_cmd.calls.clear()
+    assert release.tick([]) == 0
+    assert not release.probe_path().exists()
+    assert not any("pareton-gpu-reap.service" in call for call in release.run_cmd.calls)
