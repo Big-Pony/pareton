@@ -6,6 +6,7 @@ failure paths.
 """
 
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,27 @@ def load_notifier():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_http_post_json_sets_user_agent(monkeypatch):
+    module = load_notifier()  # Keep the real transport/request construction.
+    payload = {"content": "synthetic deployment alert"}
+
+    def fake_urlopen(request, *, timeout):
+        assert request.get_header("User-agent") == (
+            "DiscordBot (https://github.com/Pareton-ai/pareton, 1.0) "
+            "pareton-deploy-notifier/1.0"
+        )
+        assert request.get_header("Content-type") == "application/json"
+        assert request.get_method() == "POST"
+        assert json.loads(request.data) == payload
+        assert timeout == 3
+        return io.BytesIO(b'{"id":"123456"}')
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", fake_urlopen)
+    assert module.http_post_json(
+        "https://discord.com/api/webhooks/test", payload, 3
+    ) == (True, "123456")
 
 
 @pytest.fixture
