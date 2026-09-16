@@ -40,6 +40,29 @@ self-updating copy is in [`runbook.md`](runbook.md).
 
 ## A merge to `main` is a production deploy
 
+### Correctness scorer memory
+
+Pin scorer overrides in the campaign's `bench.correctness.serve_args`:
+
+```json
+["--mem-fraction-static", "0.4"]
+```
+
+The Qwen seed helper supplies these through repeatable
+`--bench-correctness-serve-args` options. The round request carries them to the
+remote harness, which appends them only to the trusted scorer's serving arguments.
+The scorer inherits the campaign's TP and GPU allocation. All Qwen stages use TP4
+and four GPUs; timed baseline, candidate and drift stages retain memory fraction
+`0.85`. No scorer TP environment setting or additional GPUs are required.
+
+Deploy the harness before seeding a campaign with these arguments. Existing
+campaigns need a pinned manifest update. Verify that the scorer's Docker launch
+uses `--mem-fraction-static 0.4` and the campaign's TP and GPU count, and require
+completed baseline and candidate correctness reports. To restore the baseline
+memory setting, remove the correctness memory override and update the manifest.
+
+### Deployment lifecycle
+
 `pareton-deploy.timer` polls `origin/main` every 60 seconds. There is no
 separate promote step. Every tick that holds the deploy lock first runs the
 stage-1 config sync (`sync-config.py deploy-hook`): managed-file drift
