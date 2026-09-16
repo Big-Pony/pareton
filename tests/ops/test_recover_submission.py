@@ -24,6 +24,7 @@ spec = importlib.util.spec_from_file_location(
 def test_module_loads_with_venv_imports():
     # db.connection imports psycopg2 lazily; module import alone must work.
     assert spec is not None
+    assert load() is not None
 
 
 def load():

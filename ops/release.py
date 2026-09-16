@@ -603,8 +603,21 @@ def gpu_probe_flow(op_id: str, probe: dict) -> None:
         _finish_request("failed", {"step": failure_step})
         clear_coordination_files()
         raise Fail(1, failure_step, units=pending)
+    invocation_id = os.environ.get("INVOCATION_ID")
+    if not invocation_id:
+        # The dispatcher only honours a probe bound to the running deploy
+        # unit's InvocationID; a direct run would get a real reap and fail
+        # later as a missing GPU-reap source.
+        failure_step = "gpu-probe-requires-deploy-unit"
+        mutate_state(
+            lambda s: s.update({"log_accepted": False, "failure_step": failure_step})
+        )
+        _restore_maint_timers(load_state())
+        _finish_request("failed", {"step": failure_step})
+        clear_coordination_files()
+        raise Fail(2, failure_step)
     request = {
-        "invocation_id": os.environ.get("INVOCATION_ID", "manual"),
+        "invocation_id": invocation_id,
         "op_id": op_id,
         "probe_id": probe["probe_id"],
         "issued_at": now_iso(),

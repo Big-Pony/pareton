@@ -1129,6 +1129,25 @@ def test_gpu_wait_timeout_reports_and_restores(base, monkeypatch):
     assert "pareton-gpu-reap.timer" in started
 
 
+def test_gpu_probe_refuses_without_deploy_invocation(base, monkeypatch):
+    write_state(
+        base,
+        phase="verifying",
+        startup_complete=True,
+        original_units={"pareton-gpu-reap.timer": {"active": True}},
+    )
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    started = []
+    monkeypatch.setattr(release, "start_unit", lambda u: started.append(u))
+    with pytest.raises(release.Fail) as info:
+        release.gpu_probe_flow("op-1", {"probe_id": "p"})
+    assert info.value.reason == "gpu-probe-requires-deploy-unit"
+    assert read_state(base)["failure_step"] == "gpu-probe-requires-deploy-unit"
+    assert "pareton-gpu-reap.service" not in started
+    assert "pareton-gpu-reap.timer" in started
+    assert not (base / "run/pareton-deploy/gpu-reap-request.json").exists()
+
+
 def test_record_step_started_at_is_tick_time(base, monkeypatch):
     monkeypatch.setenv("PARETON_TEST_NOW", "2026-09-12T12:00:00Z")
     write_state(base, updated_at="2026-09-11T00:00:00Z")
