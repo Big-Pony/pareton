@@ -923,6 +923,7 @@ def main(argv: list[str] | None = None) -> int:
                 if active.returncode == 0 and active.stdout.strip() == "active":
                     result = run_cmd(["systemctl", "restart", unit])
                     if result.returncode != 0:
+                        save_pending(pending)
                         raise Fail(4, f"owed-restart-failed:{unit}")
                     performed.append(f"restart:{unit}")
                 pending["owed_restart_units"].remove(unit)
