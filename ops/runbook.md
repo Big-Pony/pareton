@@ -244,6 +244,10 @@ Rules that matter operationally:
 - `verify` never clears hold; `rollback`/`cancel` set hold themselves.
   Only `unpause` clears it, and only when the phase is idle and the given
   `--main-commit` still equals `origin/main`.
+- `cancel` only aborts a fresh forward release before environment writes.
+  Recovery may re-enter draining/quiescing after writes; those phases do
+  not make it safe to cancel. Keep the recovery copy and use `rollback`
+  or an evidence-backed `reset` to recover instead.
 - Rollback returns to the commit the recovery copy captures
   (`recovery_commit`; `hold.baseline_commit` is anchored to that target, not
   to the pre-rollback verified commit). A vector-only fast path does NOT

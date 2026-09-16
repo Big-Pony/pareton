@@ -1178,7 +1178,7 @@ def tick_idle(state: dict) -> int:
     # restart debt.
     changed_files = _changed_files(state["verified_commit"], target)
     vector_only = (
-        bool(changed_files)
+        (bool(changed_files) or drift_exit == 1)
         and all(f == "ops/vector/vector.toml" for f in changed_files)
         and (drift_exit == 0 or _drift_only_vector())
     )
@@ -2211,6 +2211,17 @@ def _request_cancel(state: dict, request: dict) -> int:
         _refuse(request, "cancel-not-applicable")
         print(
             f"request cancel: phase is {state['phase']}; only pre-write phases",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Recovery re-enters drain/stop after the environment may have changed.
+    # Only a fresh forward release has a known, unchanged baseline to resume.
+    if state.get("direction") != "forward" or state.get("recovery_copy"):
+        _refuse(request, "cancel-after-writes")
+        print(
+            "request cancel: recovery cannot be cancelled as an unchanged "
+            "release; use rollback or an evidence-backed reset instead",
             file=sys.stderr,
         )
         return 1

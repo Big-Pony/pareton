@@ -2642,3 +2642,77 @@ def test_verify_gpu_timeout_parks_without_automatic_retry(base, monkeypatch):
     assert release.tick([]) == 0
     assert not release.probe_path().exists()
     assert not any("pareton-gpu-reap.service" in call for call in release.run_cmd.calls)
+
+
+@pytest.mark.parametrize("operation", ["resume", "rollback"])
+@pytest.mark.parametrize("phase", ["draining", "quiescing"])
+def test_cancel_refuses_recovery_after_prior_apply(base, monkeypatch, operation, phase):
+    # Recovery can fail while re-entering drain/stop. Its phase alone no
+    # longer proves that HEAD and dependencies are the verified baseline.
+    write_state(
+        base,
+        phase="applying",
+        verified_commit="A",
+        from_commit="A",
+        target_commit="B",
+        recovery_copy="/saved/A",
+        recovery_commit="A",
+    )
+
+    def interrupted_recovery(state):
+        release.mutate_state(lambda s: s.update({"phase": phase}))
+        raise subprocess.TimeoutExpired(["systemctl", "is-active"], 30)
+
+    monkeypatch.setattr(release, "tick_draining", interrupted_recovery)
+    assert release.cmd_request([operation, "--operator", "o"]) == 0
+    assert release.tick([]) == 2
+    before = read_state(base)
+    assert before["phase"] == phase
+    assert before["recovery_copy"] == "/saved/A"
+
+    assert release.cmd_request(["cancel", "--operator", "o"]) == 0
+    release.run_cmd.calls.clear()
+    assert release.tick([]) == 1
+    assert read_state(base) == before
+    assert not any(c[:2] == ["systemctl", "start"] for c in release.run_cmd.calls)
+    request = release.read_json(release.request_path())
+    assert request["status"] == "failed"
+    assert request["result"]["step"] == "cancel-after-writes"
+
+
+def test_cancel_refuses_reset_without_recovery_copy(base):
+    # A reset's operator-declared baseline has not yet been established.
+    before = write_state(base, phase="quiescing", direction="reset")
+    assert release.cmd_request(["cancel", "--operator", "o"]) == 0
+    assert release.tick([]) == 1
+    assert read_state(base) == before
+    assert not any(c[:2] == ["systemctl", "start"] for c in release.run_cmd.calls)
+
+
+def test_same_commit_vector_drift_does_not_drain_business(base, monkeypatch):
+    write_state(base)
+    release.run_cmd.git_refs = {"origin/main": "c1", "HEAD": "c1"}
+    release.run_cmd.sync_exit = 1
+    release.run_cmd.sync_stdout = json.dumps(
+        {"findings": [{"category": "different", "target": "/etc/vector/vector.toml"}]}
+    )
+    monkeypatch.setattr(release, "_current_environment_healthy", lambda: True)
+    monkeypatch.setattr(release, "gpu_probe_flow", lambda *_args: None)
+    monkeypatch.setattr(
+        release, "run_log_check", lambda *_args, **_kwargs: (0, {"missing": []})
+    )
+    monkeypatch.setattr(
+        release,
+        "tick_draining",
+        lambda *_args: pytest.fail("Vector-only drift must not drain business"),
+    )
+
+    assert release.tick([]) == 0
+    state = read_state(base)
+    assert (state["phase"], state["verified_commit"], state["log_accepted"]) == (
+        "idle",
+        "c1",
+        True,
+    )
+    assert any("--install-only" in c for c in release.run_cmd.calls)
+    assert not any(c[:2] == ["systemctl", "stop"] for c in release.run_cmd.calls)
