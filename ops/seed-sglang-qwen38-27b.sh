@@ -5,6 +5,9 @@
 # lmsysorg/sglang runtime image lacks the trusted offline miner-build installer.
 # The harness mounts pinned weights at /model and manages Docker networking,
 # listen address, port and GPU allocation separately from these serving flags.
+# RadixArk's checkpoint uses mixed NVFP4/FP8 layers with a BF16 lm_head.
+# SGLang loads its per-layer quantization with modelopt_mixed.
+# Reserve scorer memory for full-input logprobs (logprob_start_len=0).
 set -euo pipefail
 engine_ref=${1:?Usage: seed-sglang-qwen38-27b.sh PUBLISHED_ENGINE_DIGEST_REF}
 if [[ ! "$engine_ref" =~ ^ghcr\.io/pareton-ai/(pareton-engine|pareton-baseline)@sha256:[a-f0-9]{64}$ ]]; then
@@ -19,12 +22,13 @@ python -m campaign.seed \
   --base-image-digest "$engine_ref" \
   --baseline-engine-image-digest "$engine_ref" \
   --gpu-skus RTX5090 --bench-gpu-count 4 \
-  --bench-model-repo Qwen/Qwen3.8-27B-FP8 \
-  --bench-model-revision 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a \
-  --bench-dtype bfloat16 --bench-quantization fp8 --bench-max-model-len 262144 \
+  --bench-model-repo RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead \
+  --bench-model-revision 009632fef96dd349150baa780c984e62e70e91fe \
+  --bench-dtype bfloat16 --bench-quantization modelopt_mixed --bench-max-model-len 262144 \
   --bench-serve-args=--trust-remote-code \
   --bench-serve-args=--served-model-name --bench-serve-args=qwen3.8-27b \
   --bench-serve-args=--tp-size --bench-serve-args=4 \
+  --bench-serve-args=--kv-cache-dtype --bench-serve-args=bfloat16 \
   --bench-serve-args=--mem-fraction-static --bench-serve-args=0.85 \
   --bench-serve-args=--attention-backend --bench-serve-args=flashinfer \
   --bench-serve-args=--chunked-prefill-size --bench-serve-args=8192 \
@@ -34,6 +38,7 @@ python -m campaign.seed \
   --bench-serve-args=--tool-call-parser --bench-serve-args=qwen3_coder \
   --bench-serve-args=--enable-cache-report \
   --bench-correctness-num-prompts 32 \
+  --bench-correctness-serve-args=--mem-fraction-static --bench-correctness-serve-args=0.4 \
   --bench-correctness-min-mean-logprob=-4 \
   --bench-correctness-min-token-logprob=-12 \
   --bench-correctness-min-token-quantile=0.001 \
@@ -41,5 +46,5 @@ python -m campaign.seed \
   --bench-correctness-max-mean-logprob-drop=1.5 \
   --sampling-rule-json fixtures/campaigns/sglang_qwen38_27b/sampling_rule.json \
   --scoring-rule-json fixtures/campaigns/sglang_qwen38_27b/scoring_rule.json \
-  --status open --emission-start-weight 0.10 --emission-floor-weight 0 \
+  --status open --emission-start-weight 0.20 --emission-floor-weight 0 \
   --emission-decay-blocks 201600 --force

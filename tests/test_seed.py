@@ -201,11 +201,12 @@ def test_sglang_requires_source_pin_before_writing(monkeypatch):
     assert captured["profile_data"] is None
 
 
-def test_sglang_launch_helper_produces_fp8_worker_request(monkeypatch, tmp_path):
+def test_sglang_launch_helper_produces_nvfp4_worker_request(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
+    from bench.main import plan_round_starts
     from bench.trajectory import length_groups
-    from bench.validate import sha256_file
+    from bench.validate import sha256_file, validate_bench_request_dict
     from worker.round_job import build_round_request
 
     captured = _patch_store(monkeypatch)
@@ -259,16 +260,16 @@ def test_sglang_launch_helper_produces_fp8_worker_request(monkeypatch, tmp_path)
     assert manifest.status == "open"
     assert manifest.emission_rule == {
         "name": "linear_decay",
-        "start_weight": 0.1,
+        "start_weight": 0.2,
         "floor_weight": 0.0,
         "decay_blocks": 201600,
     }
     assert manifest.allowed_paths == ["python/sglang/**", "rust/**"]
     assert "**/CMakeLists.txt" not in manifest.denied_paths
     assert manifest.engine["install_cmd"] == "/usr/local/bin/pareton-install-sglang"
-    assert request["model"]["hf_repo"] == "Qwen/Qwen3.8-27B-FP8"
-    assert request["model"]["hf_revision"] == "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
-    assert request["model"]["quantization"] == "fp8"
+    assert request["model"]["hf_repo"] == "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead"
+    assert request["model"]["hf_revision"] == "009632fef96dd349150baa780c984e62e70e91fe"
+    assert request["model"]["quantization"] == "modelopt_mixed"
     assert request["model"]["max_model_len"] == 262144
     assert request["hardware"]["gpu_count"] == 4
     assert request["hardware"]["gpu_sku_expected"] == "RTX5090"
@@ -287,7 +288,7 @@ def test_sglang_launch_helper_produces_fp8_worker_request(monkeypatch, tmp_path)
             / "fixtures/campaigns/sglang_qwen38_27b/campaign-fields.json"
         ).read_text()
     )
-    for key in ("model", "gpu_count", "serve_args"):
+    for key in ("model", "gpu_count", "serve_args", "correctness"):
         assert example["bench"][key] == manifest.bench[key]
     assert example["sampling_rule"] == manifest.sampling_rule
     assert example["scoring_rule"] == manifest.scoring_rule
@@ -300,6 +301,22 @@ def test_sglang_launch_helper_produces_fp8_worker_request(monkeypatch, tmp_path)
     assert [g["count"] for g in groups] == [8, 8, 8, 8]
     assert all(g["max_tokens"] + 5120 + 2 <= 262144 for g in groups)
     baseline = request["engines"]["baseline"]
+    parsed = validate_bench_request_dict(request)
+    assert parsed.correctness.serve_args == ["--mem-fraction-static", "0.4"]
+    plan = plan_round_starts(
+        parsed.engines, correctness_serve_args=parsed.correctness.serve_args
+    )
+    assert [start.kind for start in plan] == [
+        "baseline",
+        "candidate",
+        "scorer",
+        "drift",
+    ]
+    for start in plan:
+        if start.kind == "scorer":
+            assert start.spec.serve_args[-2:] == ["--mem-fraction-static", "0.4"]
+        else:
+            assert start.spec.serve_args == baseline["serve_args"]
     assert baseline["name"] == "sglang"
     assert request["engines"]["candidates"][0]["serve_args"] == baseline["serve_args"]
     assert baseline["serve_args"] == [
@@ -310,12 +327,14 @@ def test_sglang_launch_helper_produces_fp8_worker_request(monkeypatch, tmp_path)
         "--dtype",
         "bfloat16",
         "--quantization",
-        "fp8",
+        "modelopt_mixed",
         "--trust-remote-code",
         "--served-model-name",
         "qwen3.8-27b",
         "--tp-size",
         "4",
+        "--kv-cache-dtype",
+        "bfloat16",
         "--mem-fraction-static",
         "0.85",
         "--attention-backend",

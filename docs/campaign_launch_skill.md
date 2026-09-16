@@ -327,7 +327,7 @@ configuration before opening, using the normal deployment process.
 
 ## 4. Open the Qwen campaign
 
-The launch helper targets four RTX 5090 GPUs, `Qwen/Qwen3.8-27B-FP8`, context length
+The launch helper targets four RTX 5090 GPUs, `RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead`, context length
 262144, 32 requests spaced 2 ms apart and up to 5120 output tokens. Sampler
 version 3 uses complete conversation prefixes across four groups with eight
 requests each. Targets are fixed at 4096, 8192, 16384 and 32768 input tokens,
@@ -336,13 +336,27 @@ room for the full output ceiling. This workload covers inputs up to 32K while
 retaining the 262144-token model limit. Source preflight must fill every tier
 before opening. Thinking is enabled and the failure coefficient is 0.1.
 The model revision is
-`017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`. Its
-[model configuration](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a/config.json)
-declares the Qwen3.5 architecture, BF16 activation dtype and dynamic FP8 E4M3
-quantization with 128-by-128 weight blocks. Pin `bench.model.quantization: "fp8"`
-and `bench.model.dtype: "bfloat16"`. Its safetensors weights total about 28.75 GiB,
-before KV cache and workspace. The workload pin is in
+`009632fef96dd349150baa780c984e62e70e91fe`. Its
+[model configuration](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead/blob/009632fef96dd349150baa780c984e62e70e91fe/config.json)
+declares the Qwen3.5 architecture, BF16 activation dtype and ModelOpt mixed
+quantization: NVFP4 for MLP layers, FP8 for attention layers and BF16 for
+`lm_head`.
+Pin `bench.model.quantization: "modelopt_mixed"` and
+`bench.model.dtype: "bfloat16"`. The pinned SGLang source supports this loader;
+`fp8` would select the wrong checkpoint format. See the
+[RadixArk model card](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead/blob/009632fef96dd349150baa780c984e62e70e91fe/README.md)
+for the quantization recipe. The workload pin is in
 `fixtures/campaigns/sglang_qwen38_27b/sampling_rule.json`.
+
+The pinned RadixArk tokenizer config has no embedded chat template. Both the
+sampler and standalone sample load `chat_template.jinja` from the same model
+revision. That template and `tokenizer.json` are byte-identical to the previous
+NVIDIA NVFP4 and original Qwen FP8 pins. Sixteen formatter comparisons covering
+thinking on/off, conversation history, tool results, Unicode/code and long
+inputs produced identical text and token IDs. RadixArk's padding token differs
+from Qwen FP8, but the template does not use it and the sampler disables padding.
+See the [tokenizer validation record](../fixtures/campaigns/sglang_qwen38_27b/tokenizer-validation.json)
+for hashes, inputs and the scope of this CPU check.
 
 The native images and the earlier one-H200, 8192-context FP8 configuration
 passed validation on 2026-09-09
@@ -354,7 +368,8 @@ exact 8192-token scorer probe also passed. All validation pods and volumes were
 deleted, with provider API readback. See the
 [validation record](../fixtures/campaigns/sglang_qwen38_27b/validation-evidence.json)
 and [full round report](../fixtures/campaigns/sglang_qwen38_27b/validation/bench_report.json).
-Those checks do not validate the updated 262K workload on four RTX 5090 GPUs.
+Those FP8 checks do not validate the NVFP4 checkpoint or the updated 262K
+workload on four RTX 5090 GPUs.
 Run source coverage preflight and GPU calibration with the new sampling, thinking and
 serving settings before opening. The earlier BF16/Python-only measurements
 remain historical evidence in `HANDOFF.md`. See the
@@ -376,22 +391,23 @@ Sample campaign entries, in addition to the source and image pins:
   },
   "emission_rule": {
     "name": "linear_decay",
-    "start_weight": 0.1,
+    "start_weight": 0.2,
     "floor_weight": 0,
     "decay_blocks": 201600
   },
   "bench": {
     "model": {
-      "hf_repo": "Qwen/Qwen3.8-27B-FP8",
-      "hf_revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+      "hf_repo": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
+      "hf_revision": "009632fef96dd349150baa780c984e62e70e91fe",
       "dtype": "bfloat16",
-      "quantization": "fp8",
+      "quantization": "modelopt_mixed",
       "max_model_len": 262144
     },
     "gpu_count": 4,
     "serve_args": [
       "--trust-remote-code", "--served-model-name", "qwen3.8-27b",
       "--tp-size", "4", "--mem-fraction-static", "0.85",
+      "--kv-cache-dtype", "bfloat16",
       "--attention-backend", "flashinfer", "--chunked-prefill-size", "8192",
       "--mamba-radix-cache-strategy", "extra_buffer", "--max-running-requests", "40",
       "--reasoning-parser", "qwen3", "--tool-call-parser", "qwen3_coder",
@@ -415,10 +431,35 @@ The seed command supplies both image fields, loads `sampling_rule.json` and
 `scoring_rule.json`, checks source coverage and signs the completed manifest.
 Sample fields are in `fixtures/campaigns/sglang_qwen38_27b/campaign-fields.json`.
 The companion `image-pins.json` records the native serving and mutation image
-digests validated under the earlier 8K workload. The sample uses FP8 weights, the native installer, Rust/CMake
+digests validated under the earlier 8K workload. The sample uses the NVFP4 checkpoint, the native installer, Rust/CMake
 allowances and the nested AOT test exclusions. It contains no campaign ID and
 does not represent a created row. Use its `engine_image` for both campaign image
 fields. The dependency build base and mutation image have separate roles.
+
+### Static SSH host
+
+Set these variables in the worker environment:
+
+```ini
+PARETON_GPU_PROVIDERS=static_ssh
+PARETON_GPU_STATIC_SSH=user@host:port
+PARETON_GPU_SSH_KEY_PATH=/path/to/key
+```
+
+`host` can be a reachable DNS name or IPv4 address; the optional port defaults
+to 22. The current parser does not accept IPv6 literals. The private key must
+exist at the configured path on the worker and support noninteractive SSH.
+The target needs the campaign's four RTX 5090 GPUs, working NVIDIA drivers and
+Docker host access; bootstrap uses root or sudo for host setup.
+
+The VM's provider name and hostname have no Pareton naming requirement.
+The orchestrator generates `pt-<UTC timestamp>-<ttl>h-<8 hex digits>` as an
+internal run name, without renaming the VM. Static SSH does not register a
+managed rental, and its destroy operation is a no-op. The reaper can clean idle
+benchmark containers on the static host, but does not delete the VM.
+Keep manually managed cloud VMs outside that `pt-...` naming
+pattern: the reaper also scans credentialed cloud providers and can delete
+expired resources with matching names, even when static SSH is selected.
 
 After successful image and GPU checks, run this once with the published engine ref:
 
@@ -426,8 +467,8 @@ After successful image and GPU checks, run this once with the published engine r
 bash ops/seed-sglang-qwen38-27b.sh "$NATIVE_ENGINE_REF"
 ```
 
-It uses `--status open --emission-start-weight 0.10 --emission-floor-weight 0 --force`.
-A fresh leader starts at 10% of subnet emissions, declining linearly to the
+It uses `--status open --emission-start-weight 0.20 --emission-floor-weight 0 --force`.
+A fresh leader starts at 20% of subnet emissions, declining linearly to the
 existing zero floor over 201600 blocks held. `--force` creates the new campaign
 alongside the existing open campaign. Omit `--no-bench`: submissions must still
 be evaluated.

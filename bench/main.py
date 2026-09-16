@@ -125,12 +125,15 @@ EXIT_ENGINE = 3
 logger = logging.getLogger("bench")
 
 
-def scorer_engine_spec(spec: EngineSpec) -> EngineSpec:
+def scorer_engine_spec(
+    spec: EngineSpec, *, serve_args: list[str] | None = None
+) -> EngineSpec:
     """The scorer: the campaign's own baseline image plus the scorer flags.
 
     The scorer is per campaign rather than per candidate, and it is derived
     from the pinned baseline rather than named separately, so a campaign
-    manifest carries no scorer field of its own.
+    manifest carries no scorer image of its own. Campaign correctness serving
+    arguments override baseline arguments only for this derived spec.
     """
     extra = correctness_extra_serve_args(spec.name)
     args = list(spec.serve_args)
@@ -158,7 +161,7 @@ def scorer_engine_spec(spec: EngineSpec) -> EngineSpec:
         env[override_env] = "1"
     return EngineSpec(
         image=spec.image,
-        serve_args=args + extra,
+        serve_args=args + list(serve_args or []) + extra,
         env=env,
         cache_dir=spec.cache_dir,
         name=spec.name,
@@ -191,7 +194,12 @@ class EngineStart:
     steps: int = 0
 
 
-def plan_round_starts(engines: EnginesSpec, *, mode: str = "all") -> list[EngineStart]:
+def plan_round_starts(
+    engines: EnginesSpec,
+    *,
+    mode: str = "all",
+    correctness_serve_args: list[str] | None = None,
+) -> list[EngineStart]:
     """Every container this round will start, in order.
 
     The runner consumes this list, so the plan is the only place a start can
@@ -227,7 +235,9 @@ def plan_round_starts(engines: EnginesSpec, *, mode: str = "all") -> list[Engine
             EngineStart(
                 role="scorer",
                 kind="scorer",
-                spec=scorer_engine_spec(engines.baseline),
+                spec=scorer_engine_spec(
+                    engines.baseline, serve_args=correctness_serve_args
+                ),
                 mount_engine_cache=False,
             )
         )
@@ -532,7 +542,11 @@ def run_round(
 ]:
     """Execute the whole round against one pod. Returns the raw material."""
     requests = list(trace.requests)
-    plan = plan_round_starts(req.engines, mode=req.mode)
+    plan = plan_round_starts(
+        req.engines,
+        mode=req.mode,
+        correctness_serve_args=req.correctness.serve_args,
+    )
     layout.append_log(
         {"event": "round_plan", "starts": [s.role for s in plan], "count": len(plan)}
     )

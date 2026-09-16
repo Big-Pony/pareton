@@ -353,6 +353,8 @@ def build_round_request(
             ),
         },
     }
+    if "serve_args" in corr_cfg:
+        correctness["serve_args"] = list(corr_cfg["serve_args"])
     # The relative model-quality bar is campaign policy and is forwarded only
     # when the manifest carries it. Repeat-loop rejection is mandatory harness
     # policy in bench/correctness.py and is intentionally absent here.
@@ -816,9 +818,8 @@ def _process_round(
                     **extra,
                 )
             except NoCapacityError as exc:
-                # Nothing was rented, so the cohort and seed stay valid. Voiding
-                # here is what let an out-of-stock market burn a round every
-                # poll interval; keep the round and wait the market out.
+                # No evaluation started, so keep the cohort and seed while the
+                # cloud market is empty or the dedicated static host is busy.
                 raise RoundDeferred(str(exc)) from exc
             except ProvisionError as exc:
                 provision_error = True

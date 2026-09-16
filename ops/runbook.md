@@ -7,9 +7,9 @@ touches business data, rounds, or GPU state.
 
 ## 0. Facts this runbook assumes
 
-- Target host: the authorized validator VPS (`188.166.18.9`, seen as
-  `pareton-prod-02`); owner-confirmed to be the only production host, or each
-  additional host gets its own recorded run of this runbook.
+- Target host: the authorized validator VPS; obtain its address from private
+  operations records. Confirm the production host inventory with the owner;
+  each additional host gets its own recorded run of this runbook.
 - The webhook for deploy alerts is `PARETON_DISCORD_DEPLOY_WEBHOOK` in
   `/opt/pareton/.env` (owner-placed). The Axiom token `PARETON_AXIOM_TOKEN`
   in the same file was verified by the owner via a direct ingest test.
